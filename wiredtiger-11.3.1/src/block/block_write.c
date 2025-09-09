@@ -10,7 +10,8 @@
 
 /*
  * __wti_block_truncate --
- *     Truncate the file.
+ *     截断底层文件到指定长度，更新内存中的文件大小信息，并在非备份期间尝试实际文件截断。
+ *     主要用于释放文件尾部空间，节省磁盘空间。即使底层系统调用失败，也会更新内存状态。
  */
 int
 __wti_block_truncate(WT_SESSION_IMPL *session, WT_BLOCK *block, wt_off_t len)
@@ -20,6 +21,7 @@ __wti_block_truncate(WT_SESSION_IMPL *session, WT_BLOCK *block, wt_off_t len)
 
     conn = S2C(session);
 
+    // 打印截断操作日志，便于调试和追踪
     __wt_verbose(
       session, WT_VERB_BLOCK, "truncate file %s to %" PRIuMAX, block->name, (uintmax_t)len);
 
@@ -30,6 +32,7 @@ __wti_block_truncate(WT_SESSION_IMPL *session, WT_BLOCK *block, wt_off_t len)
      * Regardless of the underlying file system call's result, the in-memory understanding of the
      * file size changes.
      */
+    // 无论系统调用结果如何，先更新内存中的文件大小
     block->size = block->extend_size = len;
 
     /*
@@ -40,6 +43,7 @@ __wti_block_truncate(WT_SESSION_IMPL *session, WT_BLOCK *block, wt_off_t len)
      * backups, which only copies log files, or targeted backups, stops all block truncation
      * unnecessarily). We may want a more targeted solution at some point.
      */
+    // 备份期间禁止截断文件，防止影响备份一致性
     if (__wt_atomic_load64(&conn->hot_backup_start) == 0)
         WT_WITH_HOTBACKUP_READ_LOCK(session, ret = __wt_ftruncate(session, block->fh, len), NULL);
 
@@ -48,12 +52,15 @@ __wti_block_truncate(WT_SESSION_IMPL *session, WT_BLOCK *block, wt_off_t len)
      * there's an open checkpoint on the file on a POSIX system, in which case the underlying
      * function returns EBUSY). It's OK, we don't have to be able to truncate files.
      */
+    // 截断失败（如EBUSY/ENOTSUP）时不报错，返回0，保证系统健壮性
     return (ret == EBUSY || ret == ENOTSUP ? 0 : ret);
 }
 
 /*
  * __wti_block_discard --
- *     Discard blocks from the system buffer cache.
+ *     控制文件在系统缓冲区中的占用，防止缓存过大影响系统性能。
+ *     当累计写入量超过阈值时，调用底层fh_advise接口通知操作系统丢弃缓存。
+ *     如果文件句柄不支持或未配置丢弃操作，则直接返回。
  */
 int
 __wti_block_discard(WT_SESSION_IMPL *session, WT_BLOCK *block, size_t added_size)
@@ -62,11 +69,13 @@ __wti_block_discard(WT_SESSION_IMPL *session, WT_BLOCK *block, size_t added_size
     WT_FILE_HANDLE *handle;
 
     /* The file may not support this call. */
+    // 检查文件句柄是否支持fh_advise（即是否能丢弃缓存），不支持则直接返回
     handle = block->fh->handle;
     if (handle->fh_advise == NULL)
         return (0);
 
     /* The call may not be configured. */
+    // 若未配置os_cache_max（最大缓存阈值），则不做丢弃操作
     if (block->os_cache_max == 0)
         return (0);
 
@@ -74,18 +83,24 @@ __wti_block_discard(WT_SESSION_IMPL *session, WT_BLOCK *block, size_t added_size
      * We're racing on the addition, but I'm not willing to serialize on it in the standard read
      * path without evidence it's needed.
      */
+    // 累加本次写入量到os_cache，若未超过阈值则直接返回
     if ((block->os_cache += added_size) <= block->os_cache_max)
         return (0);
 
+    // 超过阈值，重置os_cache计数，并调用fh_advise通知操作系统丢弃缓存
     block->os_cache = 0;
     ret = handle->fh_advise(
       handle, (WT_SESSION *)session, (wt_off_t)0, (wt_off_t)0, WT_FILE_HANDLE_DONTNEED);
+    // 对于EBUSY/ENOTSUP等错误，认为丢弃失败但不报错，保证健壮性
     return (ret == EBUSY || ret == ENOTSUP ? 0 : ret);
 }
 
 /*
  * __block_extend --
- *     Extend the file.
+ *     扩展底层文件的大小，确保后续写入有足够空间。
+ *     只有配置了extend_len时才会触发扩展，且只允许一个线程实际扩展文件。
+ *     支持有锁和无锁两种扩展方式，扩展前可释放锁以避免长时间持锁。
+ *     扩展失败（如EBUSY/ENOTSUP）时不报错，保证系统健壮性。
  */
 static WT_INLINE int
 __block_extend(WT_SESSION_IMPL *session, WT_BLOCK *block, WT_FH *fh, wt_off_t offset,
@@ -107,6 +122,7 @@ __block_extend(WT_SESSION_IMPL *session, WT_BLOCK *block, WT_FH *fh, wt_off_t of
      */
 
     /* If not configured to extend the file, we're done. */
+    // 未配置扩展长度则直接返回
     if (block->extend_len == 0)
         return (0);
 
@@ -118,6 +134,7 @@ __block_extend(WT_SESSION_IMPL *session, WT_BLOCK *block, WT_FH *fh, wt_off_t of
      * case the extended file size becomes too small: if the file size catches up, every thread
      * tries to extend it.
      */
+    // 只允许在特定条件下扩展文件，避免多线程同时扩展
     if (block->extend_size > block->size &&
       (offset > block->extend_size ||
         offset + block->extend_len + (wt_off_t)align_size < block->extend_size))
@@ -128,6 +145,7 @@ __block_extend(WT_SESSION_IMPL *session, WT_BLOCK *block, WT_FH *fh, wt_off_t of
      * initialize the extended space. If a writing thread races with the extending thread, the
      * extending thread might overwrite already written data, and that would be very, very bad.
      */
+    // 检查文件句柄是否支持扩展操作
     handle = fh->handle;
     if (handle->fh_extend == NULL && handle->fh_extend_nolock == NULL)
         return (0);
@@ -140,6 +158,7 @@ __block_extend(WT_SESSION_IMPL *session, WT_BLOCK *block, WT_FH *fh, wt_off_t of
      * of extend_size being smaller than the actual file size, and that's OK, we simply may do
      * another extension sooner than otherwise.
      */
+    // 计算新的扩展目标大小，提前更新，保证并发安全
     block->extend_size = block->size + block->extend_len * 2;
 
     /*
@@ -147,6 +166,7 @@ __block_extend(WT_SESSION_IMPL *session, WT_BLOCK *block, WT_FH *fh, wt_off_t of
      * require updating on-disk file's metadata, which can be slow. (It may be a bad idea to
      * configure for file extension on systems that require locking over the extend call.)
      */
+    // 支持无锁扩展时可提前释放锁，避免长时间阻塞
     if (handle->fh_extend_nolock != NULL && *release_lockp) {
         *release_lockp = false;
         __wt_spin_unlock(session, &block->live_lock);
@@ -156,6 +176,7 @@ __block_extend(WT_SESSION_IMPL *session, WT_BLOCK *block, WT_FH *fh, wt_off_t of
      * The extend might fail (for example, the file is mapped into memory or a backup is in
      * progress), or discover file extension isn't supported; both are OK.
      */
+    // 非备份期间尝试实际扩展文件，扩展失败不报错
     if (__wt_atomic_load64(&S2C(session)->hot_backup_start) == 0)
         WT_WITH_HOTBACKUP_READ_LOCK(
           session, ret = __wt_fextend(session, fh, block->extend_size), NULL);
@@ -164,7 +185,8 @@ __block_extend(WT_SESSION_IMPL *session, WT_BLOCK *block, WT_FH *fh, wt_off_t of
 
 /*
  * __wt_block_write_size --
- *     Return the buffer size required to write a block.
+ *     计算写入一个块所需的缓冲区大小，并进行对齐和合法性检查。
+ *     限制最大写入块为(4GB-1KB)，防止溢出和异常情况。
  */
 int
 __wt_block_write_size(WT_SESSION_IMPL *session, WT_BLOCK *block, size_t *sizep)
@@ -180,7 +202,9 @@ __wt_block_write_size(WT_SESSION_IMPL *session, WT_BLOCK *block, size_t *sizep)
      * makes no sense. Limit the writes to (4GB - 1KB), it gives us potential mode bits, and I'm not
      * interested in debugging corner cases anyway.
      */
+    // 块写入需要包含块头，且按allocsize对齐
     *sizep = (size_t)WT_ALIGN(*sizep + WT_BLOCK_HEADER_BYTE_SIZE, block->allocsize);
+    // 限制最大块大小，防止溢出
     if (*sizep > UINT32_MAX - 1024)
         WT_RET_MSG(session, EINVAL, "requested block size is too large");
     return (0);
@@ -188,7 +212,8 @@ __wt_block_write_size(WT_SESSION_IMPL *session, WT_BLOCK *block, size_t *sizep)
 
 /*
  * __wt_block_write --
- *     Write a buffer into a block, returning the block's address cookie.
+ *     将缓冲区写入块文件，并返回块的地址cookie（包含objectid、offset、size、checksum）。
+ *     支持数据校验和和检查点写入，最终通过__wt_block_addr_pack编码地址信息。
  */
 int
 __wt_block_write(WT_SESSION_IMPL *session, WT_BLOCK *block, WT_ITEM *buf, uint8_t *addr,
@@ -198,9 +223,11 @@ __wt_block_write(WT_SESSION_IMPL *session, WT_BLOCK *block, WT_ITEM *buf, uint8_
     uint32_t checksum, size;
     uint8_t *endp;
 
+    // 实际写入数据到文件，获取offset、size、checksum
     WT_RET(__wti_block_write_off(
       session, block, buf, &offset, &size, &checksum, data_checksum, checkpoint_io, false));
 
+    // 将块地址信息编码到addr中，返回地址长度
     endp = addr;
     WT_RET(__wt_block_addr_pack(block, &endp, block->objectid, offset, size, checksum));
     *addr_sizep = WT_PTRDIFF(endp, addr);
@@ -210,7 +237,9 @@ __wt_block_write(WT_SESSION_IMPL *session, WT_BLOCK *block, WT_ITEM *buf, uint8_
 
 /*
  * __block_write_off --
- *     Write a buffer into a block, returning the block's offset, size and checksum.
+ *     将缓冲区写入块文件，返回块的offset、size和checksum。
+ *     负责分配空间、扩展文件、写入数据、计算校验和、更新统计和缓存、处理异常回收空间等。
+ *     支持数据校验和和检查点写入，保证写入块的完整性和一致性。
  */
 static int
 __block_write_off(WT_SESSION_IMPL *session, WT_BLOCK *block, WT_ITEM *buf, wt_off_t *offsetp,
@@ -225,6 +254,7 @@ __block_write_off(WT_SESSION_IMPL *session, WT_BLOCK *block, WT_ITEM *buf, wt_of
     uint8_t *file_sizep;
     bool local_locked;
 
+    // 初始化返回参数，防止未初始化警告
     *offsetp = 0;   /* -Werror=maybe-uninitialized */
     *sizep = 0;     /* -Werror=maybe-uninitialized */
     *checksump = 0; /* -Werror=maybe-uninitialized */
@@ -232,6 +262,7 @@ __block_write_off(WT_SESSION_IMPL *session, WT_BLOCK *block, WT_ITEM *buf, wt_of
     fh = block->fh;
 
     /* Buffers should be aligned for writing. */
+    // 检查写入缓冲区是否对齐，必须满足direct I/O要求
     if (!F_ISSET(buf, WT_ITEM_ALIGNED)) {
         WT_ASSERT(session, F_ISSET(buf, WT_ITEM_ALIGNED));
         WT_RET_MSG(session, EINVAL, "direct I/O check: write buffer incorrectly allocated");
@@ -240,6 +271,7 @@ __block_write_off(WT_SESSION_IMPL *session, WT_BLOCK *block, WT_ITEM *buf, wt_of
     /*
      * File checkpoint/recovery magic: done before sizing the buffer as it may grow the buffer.
      */
+    // 检查是否为最终检查点写入，必要时调整缓冲区内容
     if (block->final_ckpt != NULL)
         WT_RET(__wti_block_checkpoint_final(session, block, buf, &file_sizep));
 
@@ -250,6 +282,7 @@ __block_write_off(WT_SESSION_IMPL *session, WT_BLOCK *block, WT_ITEM *buf, wt_of
      * the reasons the btree layer must find out from the block-manager layer the maximum size of
      * the eventual write.
      */
+    // 计算写入对齐后的大小，保证块分配对齐
     align_size = WT_ALIGN(buf->size, block->allocsize);
     if (align_size > buf->memsize) {
         WT_ASSERT(session, align_size <= buf->memsize);
@@ -261,6 +294,7 @@ __block_write_off(WT_SESSION_IMPL *session, WT_BLOCK *block, WT_ITEM *buf, wt_of
     }
 
     /* Pre-allocate some number of extension structures. */
+    // 预分配空间管理结构，提升后续分配效率
     WT_RET(__wti_block_ext_prealloc(session, 5));
 
     /*
@@ -268,6 +302,7 @@ __block_write_off(WT_SESSION_IMPL *session, WT_BLOCK *block, WT_ITEM *buf, wt_of
      * extend the file (note the block-extend function may release the lock). Release any locally
      * acquired lock.
      */
+    // 获取live_lock锁，分配空间并扩展文件，保证并发安全
     local_locked = false;
     if (!caller_locked) {
         __wt_spin_lock(session, &block->live_lock);
@@ -284,21 +319,25 @@ __block_write_off(WT_SESSION_IMPL *session, WT_BLOCK *block, WT_ITEM *buf, wt_of
      * The file has finished changing size. If this is the final write in a checkpoint, update the
      * checkpoint's information inline.
      */
+    // 检查点写入时，更新文件大小信息到缓冲区
     if (block->final_ckpt != NULL)
         WT_RET(__wt_vpack_uint(&file_sizep, 0, (uint64_t)block->size));
 
     /* Zero out any unused bytes at the end of the buffer. */
+    // 对齐后多余空间填0，保证块内容一致性
     memset((uint8_t *)buf->mem + buf->size, 0, align_size - buf->size);
 
     /*
      * Clear the block header to ensure all of it is initialized, even the unused fields.
      */
+    // 初始化块头结构，保证所有字段有效
     blk = WT_BLOCK_HEADER_REF(buf->mem);
     memset(blk, 0, sizeof(*blk));
 
     /*
      * Set the disk size so we don't have to incrementally read blocks during salvage.
      */
+    // 设置块头中的磁盘大小字段，便于修复时定位块边界
     blk->disk_size = WT_STORE_SIZE(align_size);
 
     /*
@@ -316,6 +355,7 @@ __block_write_off(WT_SESSION_IMPL *session, WT_BLOCK *block, WT_ITEM *buf, wt_of
      * The checksum is (potentially) returned in a big-endian format, swap it into place in a
      * separate step.
      */
+    // 计算块的校验和，支持全块或部分校验，保证数据完整性
     blk->flags = 0;
     if (data_checksum)
         F_SET(blk, WT_BLOCK_DATA_CKSUM);
@@ -328,6 +368,7 @@ __block_write_off(WT_SESSION_IMPL *session, WT_BLOCK *block, WT_ITEM *buf, wt_of
 #endif
 
     /* Write the block. */
+    // 实际写入数据到文件，写入失败时回收空间
     if ((ret = __wt_write(session, fh, offset, align_size, buf->mem)) != 0) {
         if (!caller_locked)
             __wt_spin_lock(session, &block->live_lock);
@@ -342,6 +383,7 @@ __block_write_off(WT_SESSION_IMPL *session, WT_BLOCK *block, WT_ITEM *buf, wt_of
      * Optionally schedule writes for dirty pages in the system buffer cache, but only if the
      * current session can wait.
      */
+    // 若系统缓存脏页超过阈值且当前session可等待，则触发fsync写回
     if (block->os_cache_dirty_max != 0 && fh->written > block->os_cache_dirty_max &&
       __wt_session_can_wait(session)) {
         fh->written = 0;
@@ -356,17 +398,21 @@ __block_write_off(WT_SESSION_IMPL *session, WT_BLOCK *block, WT_ITEM *buf, wt_of
     }
 
     /* Optionally discard blocks from the buffer cache. */
+    // 写入后尝试丢弃系统缓存，释放内存资源
     WT_RET(__wti_block_discard(session, block, align_size));
 
+    // 更新统计信息
     WT_STAT_CONN_INCR(session, block_write);
     WT_STAT_CONN_INCRV(session, block_byte_write, align_size);
     if (checkpoint_io)
         WT_STAT_CONN_INCRV(session, block_byte_write_checkpoint, align_size);
 
+    // 打印调试日志
     __wt_verbose_debug2(session, WT_VERB_WRITE,
       "off %" PRIuMAX ", size %" PRIuMAX ", checksum %#" PRIx32, (uintmax_t)offset,
       (uintmax_t)align_size, checksum);
 
+    // 返回写入块的offset、size和checksum
     *offsetp = offset;
     *sizep = WT_STORE_SIZE(align_size);
     *checksump = checksum;
@@ -376,7 +422,8 @@ __block_write_off(WT_SESSION_IMPL *session, WT_BLOCK *block, WT_ITEM *buf, wt_of
 
 /*
  * __wti_block_write_off --
- *     Write a buffer into a block, returning the block's offset, size and checksum.
+ *     将缓冲区写入块文件，返回块的offset、size和checksum。
+ *     负责处理页头字节序转换，保证写入和返回内容一致性。
  */
 int
 __wti_block_write_off(WT_SESSION_IMPL *session, WT_BLOCK *block, WT_ITEM *buf, wt_off_t *offsetp,
@@ -389,6 +436,7 @@ __wti_block_write_off(WT_SESSION_IMPL *session, WT_BLOCK *block, WT_ITEM *buf, w
      * place to catch all callers. After the write, swap values back to native order so callers
      * never see anything other than their original content.
      */
+    // 写入前将页头转换为小端字节序，写入后恢复原字节序，保证跨平台一致性
     __wt_page_header_byteswap(buf->mem);
     ret = __block_write_off(
       session, block, buf, offsetp, sizep, checksump, data_checksum, checkpoint_io, caller_locked);

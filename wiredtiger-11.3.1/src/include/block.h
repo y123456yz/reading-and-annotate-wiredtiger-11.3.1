@@ -10,11 +10,13 @@
 
 /*
  * WiredTiger's block manager interface.
+ * 这是WiredTiger块管理器的核心接口定义，负责底层文件空间的分配、释放、检查点等操作。
  */
 
 /*
  * The file's description is written into the first block of the file, which means we can use an
  * offset of 0 as an invalid offset.
+ * 文件描述信息写在第一个块，offset为0表示无效偏移，用于标记空指针或未初始化状态。
  */
 #define WT_BLOCK_INVALID_OFFSET 0
 
@@ -24,13 +26,22 @@
  *	avail:	 the extents available for allocation
  *	discard: the extents freed in this checkpoint
  *
+ * 块管理器每个检查点维护三个extent列表：
+ * alloc：本次检查点分配的空间块
+ * avail：当前可分配的空闲块
+ * discard：本次检查点释放的空间块
+ *
  * An extent list is based on two skiplists: first, a by-offset list linking
  * WT_EXT elements and sorted by file offset (low-to-high), second, a by-size
  * list linking WT_SIZE elements and sorted by chunk size (low-to-high).
  *
+ * extent列表由两个跳表组成：按offset排序的WT_EXT跳表和按size排序的WT_SIZE跳表。
+ *
  * Additionally, each WT_SIZE element on the by-size has a skiplist of its own,
  * linking WT_EXT elements and sorted by file offset (low-to-high).  This list
  * has an entry for extents of a particular size.
+ *
+ * 每个WT_SIZE节点还维护一个按offset排序的WT_EXT跳表，用于管理同一size的所有extent。
  *
  * The trickiness is each individual WT_EXT element appears on two skiplists.
  * In order to minimize allocation calls, we allocate a single array of WT_EXT
@@ -39,48 +50,55 @@
  * the offset skiplist start at WT_EXT.next[0] and the entries for the size
  * skiplist start at WT_EXT.next[WT_EXT.depth].
  *
+ * 每个WT_EXT节点同时出现在两个跳表中，通过next数组和depth字段区分offset和size跳表的指针。
+ *
  * One final complication: we only maintain the per-size skiplist for the avail
  * list, the alloc and discard extent lists are not searched based on size.
+ *
+ * 只有avail列表维护size跳表，alloc和discard列表只用offset跳表。
  */
 
 /*
  * WT_EXTLIST --
  *	An extent list.
+ * extent列表结构，管理一组空闲或已分配空间块，支持按offset和size两种跳表。
  */
 struct __wt_extlist {
-    char *name; /* Name */
+    char *name; /* Name 名称，用于调试和日志 */
 
-    uint64_t bytes;   /* Byte count */
-    uint32_t entries; /* Entry count */
+    uint64_t bytes;   /* Byte count 总字节数 */
+    uint32_t entries; /* Entry count 块数量 */
 
-    uint32_t objectid; /* Written object ID */
-    wt_off_t offset;   /* Written extent offset */
-    uint32_t checksum; /* Written extent checksum */
-    uint32_t size;     /* Written extent size */
+    uint32_t objectid; /* Written object ID 写入时的对象ID */
+    wt_off_t offset;   /* Written extent offset 写入时的偏移 */
+    uint32_t checksum; /* Written extent checksum 校验和 */
+    uint32_t size;     /* Written extent size 写入时的大小 */
 
-    bool track_size; /* Maintain per-size skiplist */
+    bool track_size; /* Maintain per-size skiplist 是否维护size跳表 */
 
-    WT_EXT *last; /* Cached last element */
+    WT_EXT *last; /* Cached last element 缓存最后一个块，加速追加 */
 
-    WT_EXT *off[WT_SKIP_MAXDEPTH]; /* Size/offset skiplists */
-    WT_SIZE *sz[WT_SKIP_MAXDEPTH];
+    WT_EXT *off[WT_SKIP_MAXDEPTH]; /* Size/offset skiplists offset跳表头指针 */
+    WT_SIZE *sz[WT_SKIP_MAXDEPTH]; /* size跳表头指针 */
 };
 
 /*
  * WT_EXT --
  *	Encapsulation of an extent, either allocated or freed within the
  * checkpoint.
+ * extent结构，表示一个空间块，可能是已分配或已释放。
  */
 struct __wt_ext {
-    wt_off_t off;  /* Extent's file offset */
-    wt_off_t size; /* Extent's Size */
+    wt_off_t off;  /* Extent's file offset 块起始偏移 */
+    wt_off_t size; /* Extent's Size 块大小 */
 
-    uint8_t depth; /* Skip list depth */
+    uint8_t depth; /* Skip list depth 跳表层数（用于随机化加速查找） */
 
     /*
      * Variable-length array, sized by the number of skiplist elements. The first depth array
      * entries are the address skiplist elements, the second depth array entries are the size
      * skiplist.
+     * next数组用于跳表指针，前depth个用于offset跳表，后depth个用于size跳表。
      */
     WT_EXT *next[0]; /* Offset, size skiplists */
 };
@@ -88,39 +106,44 @@ struct __wt_ext {
 /*
  * WT_SIZE --
  *	Encapsulation of a block size skiplist entry.
+ * size分桶跳表节点，管理同一size的所有extent。
  */
 struct __wt_size {
-    wt_off_t size; /* Size */
+    wt_off_t size; /* Size 当前桶的块大小 */
 
-    uint8_t depth; /* Skip list depth */
+    uint8_t depth; /* Skip list depth 跳表层数 */
 
-    WT_EXT *off[WT_SKIP_MAXDEPTH]; /* Per-size offset skiplist */
+    WT_EXT *off[WT_SKIP_MAXDEPTH]; /* Per-size offset skiplist 按offset排序的extent跳表 */
 
     /*
      * We don't use a variable-length array for the size skiplist, we want to be able to use any
      * cached WT_SIZE structure as the head of a list, and we don't know the related WT_EXT
      * structure's depth.
+     * size跳表用固定数组，便于作为跳表头节点。
      */
     WT_SIZE *next[WT_SKIP_MAXDEPTH]; /* Size skiplist */
 };
 
 /*
  * Per session handle cached block manager information.
+ * 每个session缓存的块管理器结构，加速WT_EXT和WT_SIZE对象的分配与复用。
  */
 typedef struct {
-    WT_EXT *ext_cache;   /* List of WT_EXT handles */
-    u_int ext_cache_cnt; /* Count */
+    WT_EXT *ext_cache;   /* List of WT_EXT handles WT_EXT对象缓存链表 */
+    u_int ext_cache_cnt; /* Count 缓存数量 */
 
-    WT_SIZE *sz_cache;  /* List of WT_SIZE handles */
-    u_int sz_cache_cnt; /* Count */
+    WT_SIZE *sz_cache;  /* List of WT_SIZE handles WT_SIZE对象缓存链表 */
+    u_int sz_cache_cnt; /* Count 缓存数量 */
 } WT_BLOCK_MGR_SESSION;
 
 /*
  * WT_EXT_FOREACH --
  *	Walk a block manager skiplist.
+ * 遍历offset跳表的宏，skip为遍历指针，head为跳表头。
  * WT_EXT_FOREACH_OFF --
  *	Walk a block manager skiplist where the WT_EXT.next entries are offset
  * by the depth.
+ * 遍历size跳表的宏，next指针偏移depth。
  */
 #define WT_EXT_FOREACH(skip, head) \
     for ((skip) = (head)[0]; (skip) != NULL; (skip) = (skip)->next[0])
@@ -131,6 +154,7 @@ typedef struct {
  * WT_EXT_FOREACH_FROM_OFFSET_INCL --
  *	Walk a by-offset skiplist from the given offset, starting with the extent that contains the
  * given offset if available.
+ * 从指定offset开始遍历offset跳表，包含该offset的extent优先。
  */
 #define WT_EXT_FOREACH_FROM_OFFSET_INCL(skip, el, start)                        \
     for ((skip) = __wt_block_off_srch_inclusive((el), (start)); (skip) != NULL; \
@@ -143,13 +167,15 @@ typedef struct {
  * Version #1 checkpoint cookie format:
  *	[1] [root addr] [alloc addr] [avail addr] [discard addr]
  *	    [file size] [checkpoint size] [write generation]
+ * 检查点cookie格式，包含版本号和各类空间块信息。
  */
 #define WT_BM_CHECKPOINT_VERSION 1   /* Checkpoint format version */
-#define WT_BLOCK_EXTLIST_MAGIC 71002 /* Identify a list */
+#define WT_BLOCK_EXTLIST_MAGIC 71002 /* Identify a list 魔数，标识extent列表 */
 
 /*
  * There are two versions of the extent list blocks: the original, and a second version where
  * current checkpoint information is appended to the avail extent list.
+ * extent列表块有两种版本，第二种支持将当前检查点信息追加到avail列表。
  */
 #define WT_BLOCK_EXTLIST_VERSION_ORIG 0 /* Original version */
 #define WT_BLOCK_EXTLIST_VERSION_CKPT 1 /* Checkpoint in avail output */
@@ -157,40 +183,47 @@ typedef struct {
 /*
  * Maximum buffer required to store a checkpoint: 1 version byte followed by
  * 14 packed 8B values.
+ * 存储一个检查点所需的最大缓冲区大小。
  */
 #define WT_BLOCK_CHECKPOINT_BUFFER (1 + 14 * WT_INTPACK64_MAXSIZE)
 
+/*
+ * __wt_block_ckpt --
+ * 检查点结构，记录空间分配、释放、可用等信息。
+ */
 struct __wt_block_ckpt {
-    uint8_t version; /* Version */
+    uint8_t version; /* Version 版本号 */
 
     uint32_t root_objectid;
-    wt_off_t root_offset; /* The root */
+    wt_off_t root_offset; /* The root 根节点偏移 */
     uint32_t root_checksum, root_size;
 
-    WT_EXTLIST alloc;   /* Extents allocated */
-    WT_EXTLIST avail;   /* Extents available */
-    WT_EXTLIST discard; /* Extents discarded */
+    WT_EXTLIST alloc;   /* Extents allocated 本次分配的空间块 */
+    WT_EXTLIST avail;   /* Extents available 当前可分配空间块 */
+    WT_EXTLIST discard; /* Extents discarded 本次释放的空间块 */
 
-    wt_off_t file_size; /* Checkpoint file size */
-    uint64_t ckpt_size; /* Checkpoint byte count */
+    wt_off_t file_size; /* Checkpoint file size 检查点时文件大小 */
+    uint64_t ckpt_size; /* Checkpoint byte count 检查点字节数 */
 
-    WT_EXTLIST ckpt_avail; /* Checkpoint free'd extents */
+    WT_EXTLIST ckpt_avail; /* Checkpoint free'd extents 检查点期间释放的空间块 */
 
     /*
      * Checkpoint archive: the block manager may potentially free a lot of memory from the
      * allocation and discard extent lists when checkpoint completes. Put it off until the
      * checkpoint resolves, that lets the upper btree layer continue eviction sooner.
+     * 检查点归档，延迟释放空间块，提升eviction性能。
      */
-    WT_EXTLIST ckpt_alloc;   /* Checkpoint archive */
-    WT_EXTLIST ckpt_discard; /* Checkpoint archive */
+    WT_EXTLIST ckpt_alloc;   /* Checkpoint archive 分配归档 */
+    WT_EXTLIST ckpt_discard; /* Checkpoint archive 释放归档 */
 };
 
 /*
  * WT_BM --
  *	Block manager handle, references a single checkpoint in a btree.
+ * 块管理器句柄，引用一个btree的检查点，包含所有块管理操作方法。
  */
 struct __wt_bm {
-    /* Methods */
+    /* Methods 块管理器操作方法，函数指针接口 */
     int (*addr_invalid)(WT_BM *, WT_SESSION_IMPL *, const uint8_t *, size_t);
     int (*addr_string)(WT_BM *, WT_SESSION_IMPL *, WT_ITEM *, const uint8_t *, size_t);
     u_int (*block_header)(WT_BM *);
@@ -232,135 +265,142 @@ struct __wt_bm {
     WT_BLOCK *next_block; /* If doing a tier switch, this is going to be the new file. */
     WT_BLOCK *prev_block; /* If a tier switch was done, this was the old file. */
 
-    void *map; /* Mapped region */
-    size_t maplen;
-    void *mapped_cookie;
+    void *map; /* Mapped region 文件映射指针 */
+    size_t maplen; /* 映射长度 */
+    void *mapped_cookie; /* 映射相关cookie */
 
     /*
      * For trees, such as tiered tables, that are allowed to have more than one backing file or
      * object, we maintain an array of the block handles used by the tree. We use a reader-writer
      * mutex to protect the array. We lock it for reading when looking for a handle in the array and
      * lock it for writing when adding or removing handles in the array.
+     * 支持多文件/对象场景，维护块句柄数组，读写锁保护并发访问。
      */
     bool is_multi_handle;
-    WT_BLOCK **handle_array;       /* Array of block handles */
-    size_t handle_array_allocated; /* Size of handle array */
-    WT_RWLOCK handle_array_lock;   /* Lock for block handle array */
-    u_int handle_array_next;       /* Next open slot */
-    uint32_t max_flushed_objectid; /* Local objects at or below this id should be closed */
+    WT_BLOCK **handle_array;       /* Array of block handles 块句柄数组 */
+    size_t handle_array_allocated; /* Size of handle array 数组分配大小 */
+    WT_RWLOCK handle_array_lock;   /* Lock for block handle array 读写锁 */
+    u_int handle_array_next;       /* Next open slot 下一个可用槽位 */
+    uint32_t max_flushed_objectid; /* Local objects at or below this id should be closed 最大已刷盘对象ID */
 
     /*
      * There's only a single block manager handle that can be written, all others are checkpoints.
+     * 只有一个块管理器句柄可写，其余为只读检查点。
      */
-    bool is_live; /* The live system */
+    bool is_live; /* The live system 是否为可写系统 */
 };
 
 /*
  * WT_BLOCK --
  *	Block manager handle, references a single file.
+ * 块管理器句柄，管理一个底层文件的所有空间分配、回收、检查点等操作。
  */
 struct __wt_block {
-    const char *name;  /* Name */
-    uint32_t objectid; /* Object id */
-    uint32_t ref;      /* References */
+    const char *name;  /* Name 文件名 */
+    uint32_t objectid; /* Object id 文件对象ID（支持多对象场景） */
+    uint32_t ref;      /* References 引用计数 */
 
-    TAILQ_ENTRY(__wt_block) q;     /* Linked list of handles */
-    TAILQ_ENTRY(__wt_block) hashq; /* Hashed list of handles */
+    TAILQ_ENTRY(__wt_block) q;     /* Linked list of handles 块管理器链表节点 */
+    TAILQ_ENTRY(__wt_block) hashq; /* Hashed list of handles 哈希链表节点 */
 
-    WT_FH *fh;            /* Backing file handle */
-    wt_off_t size;        /* File size */
-    wt_off_t extend_size; /* File extended size */
-    wt_off_t extend_len;  /* File extend chunk size */
+    WT_FH *fh;            /* Backing file handle 文件句柄 */
+    wt_off_t size;        /* File size 当前文件大小 */
+    wt_off_t extend_size; /* File extended size 文件扩展后的大小 */
+    wt_off_t extend_len;  /* File extend chunk size 扩展块大小 */
 
-    bool created_during_backup; /* Created during incremental backup */
-    bool sync_on_checkpoint;    /* fsync the handle after the next checkpoint */
-    bool remote;                /* Handle references non-local object */
-    bool readonly;              /* Underlying file was opened only for reading */
+    bool created_during_backup; /* Created during incremental backup 增量备份期间创建 */
+    bool sync_on_checkpoint;    /* fsync the handle after the next checkpoint 检查点后需要fsync */
+    bool remote;                /* Handle references non-local object 是否远程对象 */
+    bool readonly;              /* Underlying file was opened only for reading 是否只读 */
 
     /* Configuration information, set when the file is opened. */
-    wt_shared uint32_t allocfirst; /* Allocation is first-fit */
-    uint32_t allocsize;            /* Allocation size */
-    size_t os_cache;               /* System buffer cache flush max */
-    size_t os_cache_max;
-    size_t os_cache_dirty_max;
+    wt_shared uint32_t allocfirst; /* Allocation is first-fit 是否采用first-fit分配策略 */
+    uint32_t allocsize;            /* Allocation size 块分配的最小单位 */
+    size_t os_cache;               /* System buffer cache flush max 系统缓存刷新阈值 */
+    size_t os_cache_max;           /* 系统缓存最大值 */
+    size_t os_cache_dirty_max;     /* 系统缓存脏页最大值 */
 
-    u_int block_header; /* Header length */
+    u_int block_header; /* Header length 块头长度 */
 
     /*
      * There is only a single checkpoint in a file that can be written; stored here, only accessed
      * by one WT_BM handle.
+     * 只允许一个可写检查点，live只被一个块管理器句柄访问。
      */
-    WT_SPINLOCK live_lock; /* Live checkpoint lock */
-    WT_BLOCK_CKPT live;    /* Live checkpoint */
-    bool live_open;        /* Live system is open */
-    enum {                 /* Live checkpoint status */
+    WT_SPINLOCK live_lock; /* Live checkpoint lock 活动检查点锁 */
+    WT_BLOCK_CKPT live;    /* Live checkpoint 活动检查点结构，管理空间分配/回收等 */
+    bool live_open;        /* Live system is open 活动系统是否打开 */
+    enum {                 /* Live checkpoint status 活动检查点状态 */
         WT_CKPT_NONE = 0,
         WT_CKPT_INPROGRESS,
         WT_CKPT_PANIC_ON_FAILURE,
         WT_CKPT_SALVAGE
     } ckpt_state;
 
-    WT_CKPT *final_ckpt; /* Final live checkpoint write */
+    WT_CKPT *final_ckpt; /* Final live checkpoint write 最终检查点写入结构 */
 
-    /* Compaction support */
-    bool compact_estimated;                    /* If compaction work has been estimated */
-    int compact_pct_tenths;                    /* Percent to compact */
-    uint64_t compact_bytes_reviewed;           /* Bytes reviewed */
-    uint64_t compact_bytes_rewritten;          /* Bytes rewritten */
-    uint64_t compact_bytes_rewritten_expected; /* The expected number of bytes to rewrite */
-    uint64_t compact_internal_pages_reviewed;  /* Internal pages reviewed */
-    uint64_t compact_pages_reviewed;           /* Pages reviewed */
-    uint64_t compact_pages_rewritten;          /* Pages rewritten */
-    uint64_t compact_pages_rewritten_expected; /* The expected number of pages to rewrite */
-    uint64_t compact_pages_skipped;            /* Pages skipped */
-    uint64_t compact_prev_pages_rewritten;     /* Pages rewritten during the previous iteration */
-    wt_off_t compact_prev_size;                /* File size at the start of a compaction pass */
-    uint32_t compact_session_id;               /* Session compacting */
+    /* Compaction support 压缩相关统计与配置 */
+    bool compact_estimated;                    /* If compaction work has been estimated 是否已估算压缩工作量 */
+    int compact_pct_tenths;                    /* Percent to compact 压缩比例（十分之一为单位） */
+    uint64_t compact_bytes_reviewed;           /* Bytes reviewed 已检查字节数 */
+    uint64_t compact_bytes_rewritten;          /* Bytes rewritten 已重写字节数 */
+    uint64_t compact_bytes_rewritten_expected; /* The expected number of bytes to rewrite 预期重写字节数 */
+    uint64_t compact_internal_pages_reviewed;  /* Internal pages reviewed 已检查内部页数 */
+    uint64_t compact_pages_reviewed;           /* Pages reviewed 已检查页数 */
+    uint64_t compact_pages_rewritten;          /* Pages rewritten 已重写页数 */
+    uint64_t compact_pages_rewritten_expected; /* The expected number of pages to rewrite 预期重写页数 */
+    uint64_t compact_pages_skipped;            /* Pages skipped 跳过页数 */
+    uint64_t compact_prev_pages_rewritten;     /* Pages rewritten during the previous iteration 上次迭代重写页数 */
+    wt_off_t compact_prev_size;                /* File size at the start of a compaction pass 压缩前文件大小 */
+    uint32_t compact_session_id;               /* Session compacting 压缩会话ID */
 
-    /* Salvage support */
-    wt_off_t slvg_off; /* Salvage file offset */
+    /* Salvage support 文件修复相关 */
+    wt_off_t slvg_off; /* Salvage file offset 修复时的文件偏移 */
 
-    /* Verification support */
-    bool verify;             /* If performing verification */
-    bool verify_layout;      /* Print out file layout information */
-    bool dump_tree_shape;    /* Print out tree shape */
-    bool verify_strict;      /* Fail hard on any error */
-    wt_off_t verify_size;    /* Checkpoint's file size */
-    WT_EXTLIST verify_alloc; /* Verification allocation list */
-    uint64_t frags;          /* Maximum frags in the file */
-    uint8_t *fragfile;       /* Per-file frag tracking list */
-    uint8_t *fragckpt;       /* Per-checkpoint frag tracking list */
+    /* Verification support 校验相关配置与统计 */
+    bool verify;             /* If performing verification 是否正在校验 */
+    bool verify_layout;      /* Print out file layout information 是否打印文件布局 */
+    bool dump_tree_shape;    /* Print out tree shape 是否打印树形结构 */
+    bool verify_strict;      /* Fail hard on any error 是否严格校验 */
+    wt_off_t verify_size;    /* Checkpoint's file size 检查点时文件大小 */
+    WT_EXTLIST verify_alloc; /* Verification allocation list 校验时分配列表 */
+    uint64_t frags;          /* Maximum frags in the file 文件最大碎片数 */
+    uint8_t *fragfile;       /* Per-file frag tracking list 文件级碎片跟踪 */
+    uint8_t *fragckpt;       /* Per-checkpoint frag tracking list 检查点级碎片跟踪 */
 
-    /* Multi-file support */
-    wt_shared uint32_t read_count; /* Count of active read requests using this block handle */
+    /* Multi-file support 多文件支持相关 */
+    wt_shared uint32_t read_count; /* Count of active read requests using this block handle 当前块句柄的活跃读请求数 */
 };
 
 /*
  * WT_BLOCK_DESC --
  *	The file's description.
+ * 文件描述结构，存储在文件头部，包含魔数、版本、校验和等元数据。
  */
 struct __wt_block_desc {
 #define WT_BLOCK_MAGIC 120897
-    uint32_t magic; /* 00-03: Magic number */
+    uint32_t magic; /* 00-03: Magic number 魔数，用于识别文件类型 */
 #define WT_BLOCK_MAJOR_VERSION 1
-    uint16_t majorv; /* 04-05: Major version */
+    uint16_t majorv; /* 04-05: Major version 主版本号 */
 #define WT_BLOCK_MINOR_VERSION 0
-    uint16_t minorv; /* 06-07: Minor version */
+    uint16_t minorv; /* 06-07: Minor version 次版本号 */
 
-    uint32_t checksum; /* 08-11: Description block checksum */
+    uint32_t checksum; /* 08-11: Description block checksum 文件头校验和 */
 
-    uint32_t unused; /* 12-15: Padding */
+    uint32_t unused; /* 12-15: Padding 填充字节，保证结构对齐 */
 };
 /*
  * WT_BLOCK_DESC_SIZE is the expected structure size -- we verify the build to ensure the compiler
  * hasn't inserted padding (padding won't cause failure, we reserve the first allocation-size block
  * of the file for this information, but it would be worth investigation, regardless).
+ * 文件描述结构的预期大小，编译时校验防止结构体被填充。
  */
 #define WT_BLOCK_DESC_SIZE 16
 
 /*
  * __wt_block_desc_byteswap --
  *     Handle big- and little-endian transformation of a description block.
+ * 处理文件描述结构的字节序转换（大端/小端），保证跨平台兼容。
  */
 static WT_INLINE void
 __wt_block_desc_byteswap(WT_BLOCK_DESC *desc)
@@ -379,6 +419,7 @@ __wt_block_desc_byteswap(WT_BLOCK_DESC *desc)
  * WT_BLOCK_HEADER --
  *	Blocks have a common header, a WT_PAGE_HEADER structure followed by a
  * block-manager specific structure: WT_BLOCK_HEADER is WiredTiger's default.
+ * 块头结构，紧跟在WT_PAGE_HEADER之后，包含块大小、校验和、标志等元数据。
  */
 struct __wt_block_header {
     /*
@@ -386,8 +427,9 @@ struct __wt_block_header {
      * don't know the expected page length, we'd have to read increasingly larger chunks from the
      * file until we find one that checksums, and that's going to be harsh given WiredTiger's
      * potentially large page sizes.)
+     * 块头中记录页面大小，便于修复时快速定位块边界。
      */
-    uint32_t disk_size; /* 00-03: on-disk page size */
+    uint32_t disk_size; /* 00-03: on-disk page size 块实际大小 */
 
     /*
      * Page checksums are stored in two places. First, the page checksum is written within the
@@ -395,24 +437,27 @@ struct __wt_block_header {
      * chances of detecting not only disk corruption but other bugs (for example, overwriting a page
      * with another valid page image). Second, a page's checksum is stored in the disk header. This
      * is for salvage, so salvage knows it has found a page that may be useful.
+     * 校验和既存于地址cookie，也存于块头，提升数据完整性和修复能力。
      */
-    uint32_t checksum; /* 04-07: checksum */
+    uint32_t checksum; /* 04-07: checksum 块校验和 */
 
 /*
  * No automatic generation: flag values cannot change, they're written to disk.
  */
-#define WT_BLOCK_DATA_CKSUM 0x1u /* Block data is part of the checksum */
-    uint8_t flags;               /* 08: flags */
+#define WT_BLOCK_DATA_CKSUM 0x1u /* Block data is part of the checksum 块数据参与校验和计算 */
+    uint8_t flags;               /* 08: flags 标志位 */
 
     /*
      * End the structure with 3 bytes of padding: it wastes space, but it leaves the structure
      * 32-bit aligned and having a few bytes to play with in the future can't hurt.
+     * 结构末尾填充3字节，保证32位对齐，便于未来扩展。
      */
-    uint8_t unused[3]; /* 09-11: unused padding */
+    uint8_t unused[3]; /* 09-11: unused padding 未使用填充 */
 };
 /*
  * WT_BLOCK_HEADER_SIZE is the number of bytes we allocate for the structure: if the compiler
  * inserts padding it will break the world.
+ * 块头结构的实际分配字节数，编译时校验防止结构体被填充。
  */
 #define WT_BLOCK_HEADER_SIZE 12
 
@@ -420,6 +465,7 @@ struct __wt_block_header {
  * __wt_block_header_byteswap_copy --
  *     Handle big- and little-endian transformation of a header block, copying from a source to a
  *     target.
+ * 块头结构的字节序转换（大端/小端），支持拷贝转换。
  */
 static WT_INLINE void
 __wt_block_header_byteswap_copy(WT_BLOCK_HEADER *from, WT_BLOCK_HEADER *to)
@@ -434,6 +480,7 @@ __wt_block_header_byteswap_copy(WT_BLOCK_HEADER *from, WT_BLOCK_HEADER *to)
 /*
  * __wt_block_header_byteswap --
  *     Handle big- and little-endian transformation of a header block.
+ * 块头结构的原地字节序转换（大端/小端）。
  */
 static WT_INLINE void
 __wt_block_header_byteswap(WT_BLOCK_HEADER *blk)
@@ -449,6 +496,7 @@ __wt_block_header_byteswap(WT_BLOCK_HEADER *blk)
  * WT_BLOCK_HEADER_BYTE
  * WT_BLOCK_HEADER_BYTE_SIZE --
  *	The first usable data byte on the block (past the combined headers).
+ * 块中首个可用数据字节（跳过WT_PAGE_HEADER和WT_BLOCK_HEADER）。
  */
 #define WT_BLOCK_HEADER_BYTE_SIZE (WT_PAGE_HEADER_SIZE + WT_BLOCK_HEADER_SIZE)
 #define WT_BLOCK_HEADER_BYTE(dsk) ((void *)((uint8_t *)(dsk) + WT_BLOCK_HEADER_BYTE_SIZE))
@@ -461,6 +509,7 @@ __wt_block_header_byteswap(WT_BLOCK_HEADER *blk)
  * We can only skip the header information when doing encryption, but we skip the first 64B when
  * doing compression; a 64B boundary may offer better alignment for the underlying compression
  * engine, and skipping 64B shouldn't make any difference in terms of compression efficiency.
+ * 块头和页头不参与压缩/加密，保证修复、解密、解压时能正确定位和分配缓冲区。
  */
 #define WT_BLOCK_COMPRESS_SKIP 64
 #define WT_BLOCK_ENCRYPT_SKIP WT_BLOCK_HEADER_BYTE_SIZE
@@ -468,6 +517,7 @@ __wt_block_header_byteswap(WT_BLOCK_HEADER *blk)
 /*
  * __wt_block_header --
  *     Return the size of the block-specific header.
+ * 返回块头结构的字节数。
  */
 static WT_INLINE u_int
 __wt_block_header(WT_BLOCK *block)
@@ -481,6 +531,7 @@ __wt_block_header(WT_BLOCK *block)
  * __wt_block_eligible_for_sweep --
  *     Return true if the block meets requirements for sweeping. The check that read reference count
  *     is zero is made elsewhere.
+ * 判断块是否满足清理（sweep）条件，主要用于后台空间回收。
  */
 static WT_INLINE bool
 __wt_block_eligible_for_sweep(WT_BM *bm, WT_BLOCK *block)

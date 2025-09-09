@@ -1667,7 +1667,7 @@ __wti_block_extlist_init(
     return (0);
 }
 
-/*
+/* 
  * __wti_block_extlist_free --
  *     Discard an extent list.
  */

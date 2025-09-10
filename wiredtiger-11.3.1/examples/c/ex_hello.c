@@ -165,7 +165,7 @@ access_example(int argc, char *argv[])
         
         printf("yang test ............. insert xxxxxx\r\n");
 
-        #define MAX_TEST_KV_NUM 2000//1000000
+        #define MAX_TEST_KV_NUM 1000//1000000
          //insert
         for (i = 0; i < MAX_TEST_KV_NUM; i++) {
             snprintf(buf, sizeof(buf), "key%d", i);
@@ -186,7 +186,7 @@ access_example(int argc, char *argv[])
         printf("yang test checkpoint.........................11111.........................\r\n");
         testutil_check(session->checkpoint(session, NULL));
         testutil_check(conn->reconfigure(conn, "checkpoint=[wait=11160]"));
-        for (i = 0; i < MAX_TEST_KV_NUM; i++) {
+        for (i = 0; i < MAX_TEST_KV_NUM - 1; i++) {
            // continue;
             snprintf(buf, sizeof(buf), "key%d", i);
             cursor->set_key(cursor, i);

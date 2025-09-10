@@ -1458,6 +1458,7 @@ err:
 /*
  * __wti_block_extlist_read --
  *     Read an extent list.
+ *     从磁盘读取extent列表并构建内存中的跳表结构。
  */
 int
 __wti_block_extlist_read(
@@ -1472,15 +1473,21 @@ __wti_block_extlist_read(
     off = size = 0;
 
     /* If there isn't a list, we're done. */
+    // 如果列表不存在（偏移量无效），直接返回
     if (el->offset == WT_BLOCK_INVALID_OFFSET)
         return (0);
 
+    // 分配临时缓冲区用于存储从磁盘读取的数据
     WT_RET(__wt_scr_alloc(session, el->size, &tmp));
+    // 从磁盘读取extent列表数据块
     WT_ERR(
       __wti_block_read_off(session, block, tmp, el->objectid, el->offset, el->size, el->checksum));
 
+    // 跳过页头，定位到数据区开始位置
     p = WT_BLOCK_HEADER_BYTE(tmp->mem);
+    // 读取第一个extent对，应该是魔数标记
     WT_ERR(__wt_extlist_read_pair(&p, &off, &size));
+    // 验证魔数：第一个值应该是WT_BLOCK_EXTLIST_MAGIC，第二个值应该是0
     if (off != WT_BLOCK_EXTLIST_MAGIC || size != 0)
         goto corrupted;
 
@@ -1492,9 +1499,15 @@ __wti_block_extlist_read(
      * fast-path append code doesn't support that, it's limited to offset. The test of "track size"
      * is short-hand for "are we reading the available-blocks list".
      */
+    // 根据是否需要维护size跳表选择插入函数
+    // - 不需要size跳表：使用__block_append（假设数据已按offset排序）
+    // - 需要size跳表：使用__block_merge（可处理未排序数据，同时维护size跳表）
     func = el->track_size == 0 ? __block_append : __block_merge;
+    
+    // 循环读取所有extent对
     for (;;) {
         WT_ERR(__wt_extlist_read_pair(&p, &off, &size));
+        // 遇到结束标记（WT_BLOCK_INVALID_OFFSET），退出循环
         if (off == WT_BLOCK_INVALID_OFFSET)
             break;
 
@@ -1504,8 +1517,11 @@ __wti_block_extlist_read(
          * it's a cheap test to do here and we'd have to do the check as part of file verification,
          * regardless.
          */
-        if (off < block->allocsize || off % block->allocsize != 0 || size % block->allocsize != 0 ||
-          off + size > ckpt_size) {
+        // 验证extent的合法性
+        if (off < block->allocsize ||              // 偏移量太小（小于分配单位）
+            off % block->allocsize != 0 ||         // 偏移量未对齐
+            size % block->allocsize != 0 ||        // 大小未对齐
+            off + size > ckpt_size) {             // 超出检查点文件大小
 corrupted:
             __wt_scr_free(session, &tmp);
             WT_BLOCK_RET(session, block, WT_ERROR,
@@ -1514,9 +1530,11 @@ corrupted:
               el->name, (intmax_t)off, (intmax_t)(off + size));
         }
 
+        // 将extent插入到内存列表中
         WT_ERR(func(session, block, el, off, size));
     }
 
+    // 打印调试信息，显示读取的extent列表内容
     WT_ERR(__block_extlist_dump(session, block, el, "read"));
 
 err:
@@ -1527,6 +1545,7 @@ err:
 /*
  * __wti_block_extlist_write --
  *     Write an extent list at the tail of the file.
+ *     将extent列表写入文件末尾。
  */
 int
 __wti_block_extlist_write(
@@ -1540,6 +1559,7 @@ __wti_block_extlist_write(
     uint32_t entries;
     uint8_t *p;
 
+    // 打印调试信息，显示要写入的extent列表内容
     WT_RET(__block_extlist_dump(session, block, el, "write"));
 
     /*
@@ -1547,7 +1567,9 @@ __wti_block_extlist_write(
      * write, unless we still have to write the extent list to include the checkpoint recovery
      * information.
      */
+    // 计算要写入的条目总数（主列表 + 附加列表）
     entries = el->entries + (additional == NULL ? 0 : additional->entries);
+    // 如果没有条目且不是最终检查点，则无需写入
     if (entries == 0 && block->final_ckpt == NULL) {
         el->offset = WT_BLOCK_INVALID_OFFSET;
         el->checksum = el->size = 0;
@@ -1560,27 +1582,42 @@ __wti_block_extlist_write(
      * Allocate memory for the extent list entries plus two additional entries: the initial
      * WT_BLOCK_EXTLIST_MAGIC/0 pair and the list- terminating WT_BLOCK_INVALID_OFFSET/0 pair.
      */
+    // 计算所需缓冲区大小：
+    // 每个extent需要2个打包的64位整数（offset和size）
+    // 加上魔数对和结束标记对，所以是(entries + 2) * 2
     size = ((size_t)entries + 2) * 2 * WT_INTPACK64_MAXSIZE;
+    // 根据块大小对齐要求调整大小
     WT_RET(__wt_block_write_size(session, block, &size));
+    // 分配缓冲区
     WT_RET(__wt_scr_alloc(session, size, &tmp));
+    
+    // 初始化页头
     dsk = tmp->mem;
     memset(dsk, 0, WT_BLOCK_HEADER_BYTE_SIZE);
-    dsk->type = WT_PAGE_BLOCK_MANAGER;
-    dsk->version = WT_PAGE_VERSION_TS;
+    dsk->type = WT_PAGE_BLOCK_MANAGER;      // 设置页类型为块管理器页
+    dsk->version = WT_PAGE_VERSION_TS;      // 设置页版本
 
     /* Fill the page's data. */
+    // 定位到数据区开始位置
     p = WT_BLOCK_HEADER_BYTE(dsk);
     /* Extent list starts */
+    // 写入魔数对，标记extent列表开始
     WT_ERR(__wt_extlist_write_pair(&p, WT_BLOCK_EXTLIST_MAGIC, 0));
+    // 写入主列表中的所有extent
     WT_EXT_FOREACH (ext, el->off) /* Free ranges */
         WT_ERR(__wt_extlist_write_pair(&p, ext->off, ext->size));
+    // 如果有附加列表，也写入其中的所有extent
     if (additional != NULL)
         WT_EXT_FOREACH (ext, additional->off) /* Free ranges */
             WT_ERR(__wt_extlist_write_pair(&p, ext->off, ext->size));
     /* Extent list stops */
+    // 写入结束标记对
+    // 第一个值是WT_BLOCK_INVALID_OFFSET
+    // 第二个值：如果是最终检查点，包含版本信息；否则为0
     WT_ERR(__wt_extlist_write_pair(
       &p, WT_BLOCK_INVALID_OFFSET, block->final_ckpt == NULL ? 0 : WT_BLOCK_EXTLIST_VERSION_CKPT));
 
+    // 设置页的数据长度和内存大小
     dsk->u.datalen = WT_PTRDIFF32(p, WT_BLOCK_HEADER_BYTE(dsk));
     tmp->size = dsk->mem_size = WT_PTRDIFF32(p, dsk);
 
@@ -1590,21 +1627,28 @@ __wti_block_extlist_write(
      * into the btree layer some day, besides, we don't need another format and this way the page
      * format can be easily verified.
      */
+    // 诊断模式下，验证页格式的正确性
     WT_ERR(__wt_verify_dsk(session, "[extent list check]", tmp));
 #endif
 
     /* Write the extent list to disk. */
+    // 将extent列表写入磁盘
+    // 参数说明：最后三个true表示：数据对齐、不是检查点、调用者负责加锁
     WT_ERR(__wti_block_write_off(
       session, block, tmp, &el->offset, &el->size, &el->checksum, true, true, true));
+    // 记录extent列表所属的对象ID
     el->objectid = block->objectid;
 
     /*
      * Remove the allocated blocks from the system's allocation list, extent blocks never appear on
      * any allocation list.
      */
+    // 从系统的已分配列表中移除extent列表占用的空间
+    // extent列表块不应该出现在任何分配列表中
     WT_TRET(
       __wti_block_off_remove_overlap(session, block, &block->live.alloc, el->offset, el->size));
 
+    // 记录写入成功的日志
     __wt_verbose(session, WT_VERB_BLOCK, "%s written %" PRIdMAX "/%" PRIu32, el->name,
       (intmax_t)el->offset, el->size);
 
@@ -1616,6 +1660,7 @@ err:
 /*
  * __wti_block_extlist_truncate --
  *     Truncate the file based on the last available extent in the list.
+ *     根据extent列表中的最后一个可用范围，截断文件。
  */
 int
 __wti_block_extlist_truncate(WT_SESSION_IMPL *session, WT_BLOCK *block, WT_EXTLIST *el)
@@ -1627,26 +1672,31 @@ __wti_block_extlist_truncate(WT_SESSION_IMPL *session, WT_BLOCK *block, WT_EXTLI
      * Check if the last available extent is at the end of the file, and if so, truncate the file
      * and discard the extent.
      */
+    // 查找extent列表中的最后一个元素
     if ((ext = __block_off_srch_last(el->off, astack)) == NULL)
-        return (0);
-    WT_ASSERT(session, ext->off + ext->size <= block->size);
+        return (0); // 如果列表为空，直接返回
+    WT_ASSERT(session, ext->off + ext->size <= block->size); // 确保范围在文件大小内
     if (ext->off + ext->size < block->size)
-        return (0);
+        return (0); // 如果最后一个范围不是文件末尾，无法截断
 
     /*
      * Remove the extent list entry. (Save the value, we need it to reset the cached file size, and
      * that can't happen until after the extent list removal succeeds.)
      */
+    // 保存最后一个extent的起始偏移量
     size = ext->off;
+    // 从extent列表中移除最后一个元素
     WT_RET(__block_off_remove(session, block, el, size, NULL));
 
     /* Truncate the file. */
+    // 调用文件截断函数
     return (__wti_block_truncate(session, block, size));
 }
 
 /*
  * __wti_block_extlist_init --
  *     Initialize an extent list.
+ *     初始化一个extent列表。
  */
 int
 __wti_block_extlist_init(
@@ -1654,22 +1704,27 @@ __wti_block_extlist_init(
 {
     size_t size;
 
+    // 清空extent列表结构
     WT_CLEAR(*el);
 
+    // 计算名称的总长度（包括name和extname）
     size =
       (name == NULL ? 0 : strlen(name)) + strlen(".") + (extname == NULL ? 0 : strlen(extname) + 1);
+    // 分配内存并格式化名称
     WT_RET(__wt_calloc_def(session, size, &el->name));
     WT_RET(__wt_snprintf(
       el->name, size, "%s.%s", name == NULL ? "" : name, extname == NULL ? "" : extname));
 
-    el->offset = WT_BLOCK_INVALID_OFFSET;
-    el->track_size = track_size;
+    // 初始化其他字段
+    el->offset = WT_BLOCK_INVALID_OFFSET; // 设置无效偏移量
+    el->track_size = track_size;          // 是否跟踪size跳表
     return (0);
 }
 
-/* 
+/*
  * __wti_block_extlist_free --
  *     Discard an extent list.
+ *     释放一个extent列表的所有资源。
  */
 void
 __wti_block_extlist_free(WT_SESSION_IMPL *session, WT_EXTLIST *el)
@@ -1677,24 +1732,29 @@ __wti_block_extlist_free(WT_SESSION_IMPL *session, WT_EXTLIST *el)
     WT_EXT *ext, *next;
     WT_SIZE *nszp, *szp;
 
+    // 释放名称字符串
     __wt_free(session, el->name);
 
+    // 遍历并释放所有offset跳表中的extent
     for (ext = el->off[0]; ext != NULL; ext = next) {
         next = ext->next[0];
         __wt_free(session, ext);
     }
+    // 遍历并释放所有size跳表中的size节点
     for (szp = el->sz[0]; szp != NULL; szp = nszp) {
         nszp = szp->next[0];
         __wt_free(session, szp);
     }
 
     /* Extent lists are re-used, clear them. */
+    // 清空extent列表结构
     WT_CLEAR(*el);
 }
 
 /*
  * __block_extlist_dump --
  *     Dump an extent list as verbose messages.
+ *     将extent列表以详细消息的形式输出，用于调试。
  */
 static int
 __block_extlist_dump(WT_SESSION_IMPL *session, WT_BLOCK *block, WT_EXTLIST *el, const char *tag)
@@ -1708,29 +1768,38 @@ __block_extlist_dump(WT_SESSION_IMPL *session, WT_BLOCK *block, WT_EXTLIST *el, 
     u_int i;
     const char *sep;
 
+    // 如果未启用布局验证且未设置详细调试级别，则直接返回
     if (!block->verify_layout &&
       !WT_VERBOSE_LEVEL_ISSET(session, WT_VERB_BLOCK, WT_VERBOSE_DEBUG_2))
         return (0);
 
+    // 分配临时缓冲区
     WT_ERR(__wt_scr_alloc(session, 0, &t1));
     if (block->verify_layout)
-        level = WT_VERBOSE_NOTICE;
+        level = WT_VERBOSE_NOTICE; // 如果启用布局验证，使用NOTICE级别
     else
-        level = WT_VERBOSE_DEBUG_2;
+        level = WT_VERBOSE_DEBUG_2; // 否则使用DEBUG_2级别
+
+    // 输出extent列表的基本信息
     __wt_verbose_level(session, WT_VERB_BLOCK, level,
       "%s extent list %s, %" PRIu32 " entries, %s bytes", tag, el->name, el->entries,
       __wt_buf_set_size(session, el->bytes, true, t1));
 
     if (el->entries == 0)
-        goto done;
+        goto done; // 如果列表为空，直接返回
 
+    // 初始化大小桶统计
     memset(sizes, 0, sizeof(sizes));
-    WT_EXT_FOREACH (ext, el->off)
+    WT_EXT_FOREACH (ext, el->off) {
+        // 根据extent的大小，将其归入对应的桶
         for (i = 9, pow = 512;; ++i, pow *= 2)
             if (ext->size <= (wt_off_t)pow) {
                 ++sizes[i];
                 break;
             }
+    }
+
+    // 输出每个大小桶的统计信息
     sep = "extents by bucket:";
     t1->size = 0;
     WT_ERR(__wt_scr_alloc(session, 0, &t2));
@@ -1741,10 +1810,12 @@ __block_extlist_dump(WT_SESSION_IMPL *session, WT_BLOCK *block, WT_EXTLIST *el, 
             sep = ",";
         }
 
+    // 输出统计结果
     __wt_verbose_level(session, WT_VERB_BLOCK, level, "%s", (char *)t1->data);
 
 done:
 err:
+    // 释放临时缓冲区
     __wt_scr_free(session, &t1);
     __wt_scr_free(session, &t2);
     return (ret);

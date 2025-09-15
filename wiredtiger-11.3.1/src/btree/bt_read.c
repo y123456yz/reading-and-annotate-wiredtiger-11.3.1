@@ -11,6 +11,7 @@
 /*
  * __evict_force_check --
  *     Check if a page matches the criteria for forced eviction.
+ *     检查页面是否符合强制逐出的条件。
  */
 static bool
 __evict_force_check(WT_SESSION_IMPL *session, WT_REF *ref)
@@ -19,68 +20,83 @@ __evict_force_check(WT_SESSION_IMPL *session, WT_REF *ref)
     WT_PAGE *page;
     size_t footprint;
 
+    /* 获取当前会话关联的 B 树和页面指针 */
     btree = S2BT(session);
     page = ref->page;
 
-    /* Leaf pages only. */
+    /* 
+     * 仅对叶子页面进行强制逐出检查。
+     * 如果是内部页面（internal page），直接返回 false。
+     */
     if (F_ISSET(ref, WT_REF_FLAG_INTERNAL))
         return (false);
 
     /*
-     * It's hard to imagine a page with a huge memory footprint that has never been modified, but
-     * check to be sure.
+     * 检查页面是否是干净的（未修改过）。
+     * 如果页面是干净的，则无需强制逐出，直接返回 false。
+     * 通常，未修改的页面不会占用大量内存。
      */
     if (__wt_page_evict_clean(page))
         return (false);
 
     /*
-     * Exclude the disk image size from the footprint checks.  Usually the
-     * disk image size is small compared with the in-memory limit (e.g.
-     * 16KB vs 5MB), so this doesn't make a big difference.  Where it is
-     * important is for pages with a small number of large values, where
-     * the disk image size takes into account large values that have
-     * already been written and should not trigger forced eviction.
+     * 计算页面的内存占用（memory footprint），并排除磁盘映像的大小。
+     * 通常磁盘映像的大小较小（例如 16KB），而内存限制较大（例如 5MB），
+     * 因此磁盘映像的大小对内存占用的影响较小。
+     * 对于包含少量大值的页面，磁盘映像大小可能较大，但这些值已经写入磁盘，
+     * 不应触发强制逐出。
      */
     footprint = __wt_atomic_loadsize(&page->memory_footprint);
     if (page->dsk != NULL)
         footprint -= page->dsk->mem_size;
 
-    /* Pages are usually small enough, check that first. */
+    /* 
+     * 如果页面的内存占用小于 B 树的分裂内存阈值（splitmempage），
+     * 则无需强制逐出，直接返回 false。
+     */
     if (footprint < btree->splitmempage)
         return (false);
 
     /*
-     * If this session has more than one hazard pointer, eviction will fail and there is no point
-     * trying.
+     * 如果当前会话对页面持有多个 hazard 指针，则无法逐出页面，
+     * 因此无需尝试强制逐出，直接返回 false。
      */
     if (__wt_hazard_count(session, ref) > 1)
         return (false);
 
     /*
-     * If the page is less than the maximum size and can be split in-memory, let's try that first
-     * without forcing the page to evict on release.
+     * 如果页面的内存占用小于最大内存阈值（maxmempage），并且页面可以在内存中拆分，
+     * 则优先尝试内存拆分，而不是强制逐出。
      */
     if (footprint < btree->maxmempage) {
         if (__wt_leaf_page_can_split(session, page))
-            return (true);
-        return (false);
+            return (true); // 页面可以拆分，返回 true，触发内存拆分
+        return (false);    // 页面不能拆分，返回 false
     }
 
-    /* Bump the oldest ID, we're about to do some visibility checks. */
+    /* 
+     * 更新最旧事务 ID，以确保后续的可见性检查是基于最新的事务状态。
+     * 如果事务 ID 落后于当前状态，可能会导致逐出失败。
+     */
     WT_IGNORE_RET(__wt_txn_update_oldest(session, 0));
 
     /*
-     * Allow some leeway if the transaction ID isn't moving forward since it is unlikely eviction
-     * will be able to evict the page. Don't keep skipping the page indefinitely or large records
-     * can lead to extremely large memory footprints.
+     * 如果事务 ID 长时间未推进，说明逐出页面的可能性较低。
+     * 但为了避免页面被无限跳过，导致内存占用过大，仍需进行逐出检查。
      */
     if (!__wt_page_evict_retry(session, page))
         return (false);
 
-    /* Trigger eviction on the next page release. */
+    /* 
+     * 标记页面为“即将逐出”（evict soon），
+     * 以便在页面释放时触发逐出操作。
+     */
     __wt_evict_page_soon(session, ref);
 
-    /* If eviction cannot succeed, don't try. */
+    /*
+     * 检查页面是否可以逐出。
+     * 如果页面无法逐出，则返回 false。
+     */
     return (__wt_page_can_evict(session, ref, NULL));
 }
 
@@ -127,6 +143,7 @@ __wt_page_release_evict(WT_SESSION_IMPL *session, WT_REF *ref, uint32_t flags)
         WT_RET(__wt_curhs_cache(session));
     }
     (void)__wt_atomic_addv32(&btree->evict_busy, 1);
+    //printf("yang test .....__wt_page_release_evict....... xxxx, page:%p\r\n", (void *)ref->page);
     ret = __wt_evict(session, ref, previous_state, evict_flags);
     (void)__wt_atomic_subv32(&btree->evict_busy, 1);
 
@@ -456,6 +473,7 @@ read:
              */
             if (force_attempts < 10 && __evict_force_check(session, ref)) {
                 ++force_attempts;
+                //printf("yang test ........wt page in func....page:%p.... \r\n", ref->page);
                 ret = __wt_page_release_evict(session, ref, 0);
                 /*
                  * If forced eviction succeeded, don't retry. If it failed, stall.

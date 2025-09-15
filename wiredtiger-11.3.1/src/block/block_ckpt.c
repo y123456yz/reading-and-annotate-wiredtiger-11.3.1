@@ -183,6 +183,7 @@ err:
 /*
  * __wt_block_checkpoint_unload --
  *     Unload a checkpoint.
+ *     卸载一个检查点，释放相关内存资源
  */
 int
 __wt_block_checkpoint_unload(WT_SESSION_IMPL *session, WT_BLOCK *block, bool checkpoint)
@@ -190,6 +191,7 @@ __wt_block_checkpoint_unload(WT_SESSION_IMPL *session, WT_BLOCK *block, bool che
     WT_DECL_RET;
 
     /* Verify cleanup. */
+    // 如果启用了验证模式，调用检查点卸载的验证函数，确保一致性。
     if (block->verify)
         WT_TRET(__wti_verify_ckpt_unload(session, block));
 
@@ -197,16 +199,27 @@ __wt_block_checkpoint_unload(WT_SESSION_IMPL *session, WT_BLOCK *block, bool che
      * If it's the live system, truncate to discard any extended blocks and discard the active
      * extent lists. Hold the lock even though we're unloading the live checkpoint, there could be
      * readers active in other checkpoints.
+     * 如果是活动系统（非检查点），需要截断文件以丢弃任何扩展的块，并清理活动的范围列表。
+     * 即使我们正在卸载活动检查点，也需要持有锁，因为其他检查点中可能有活跃的读者。
      */
     if (!checkpoint) {
+        // 截断文件到当前大小，丢弃任何扩展的块。
         WT_TRET(__wti_block_truncate(session, block, block->size));
 
+        // 获取活动检查点的锁，确保线程安全。
         __wt_spin_lock(session, &block->live_lock);
+
+        // 销毁活动检查点的范围列表，释放相关资源。
         __wti_block_ckpt_destroy(session, &block->live);
+
+        // 标记活动检查点为关闭状态。
         block->live_open = false;
+
+        // 释放活动检查点的锁。
         __wt_spin_unlock(session, &block->live_lock);
     }
 
+    // 返回操作结果（如果有错误，返回错误码）。
     return (ret);
 }
 

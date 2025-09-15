@@ -291,22 +291,46 @@ err:
 /*
  * __tier_operation --
  *     Given an ID generate the URI names and call the operation code to flush or finish.
+ *     根据给定的 ID 生成 URI 名称，并调用操作代码执行刷新或完成操作。
  */
 static int
 __tier_operation(WT_SESSION_IMPL *session, WT_TIERED *tiered, uint32_t id, uint32_t op)
 {
-    WT_DECL_RET;
-    const char *local_uri, *obj_uri;
+    WT_DECL_RET; // 声明一个变量 `ret` 用于存储函数的返回值。
+    const char *local_uri, *obj_uri; // 定义两个指针变量，用于存储本地 URI 和对象 URI。
 
-    local_uri = obj_uri = NULL;
+    local_uri = obj_uri = NULL; // 初始化 URI 指针为空。
+
+    /*
+     * 生成本地存储的 URI。
+     * `WT_TIERED_NAME_LOCAL` 表示生成本地存储的 URI 名称。
+     * 例如：将 ID 和 tiered 的信息组合生成一个唯一的本地 URI。
+     */
     WT_ERR(__wt_tiered_name(session, &tiered->iface, id, WT_TIERED_NAME_LOCAL, &local_uri));
+
+    /*
+     * 生成共享存储的 URI。
+     * `WT_TIERED_NAME_OBJECT` 表示生成共享存储的 URI 名称。
+     * 例如：将 ID 和 tiered 的信息组合生成一个唯一的对象 URI。
+     */
     WT_ERR(__wt_tiered_name(session, &tiered->iface, id, WT_TIERED_NAME_OBJECT, &obj_uri));
+
+    /*
+     * 调用具体的操作函数执行操作。
+     * `__tier_do_operation` 是一个通用函数，根据传入的操作类型（`op`）执行具体的操作。
+     * 例如：刷新（flush）数据到共享存储，或者完成（finish）某些操作。
+     */
     WT_ERR(__tier_do_operation(session, tiered, id, local_uri, obj_uri, op));
 
 err:
+    /*
+     * 释放分配的 URI 内存。
+     * 确保在函数结束时释放 `local_uri` 和 `obj_uri`，避免内存泄漏。
+     */
     __wt_free(session, local_uri);
     __wt_free(session, obj_uri);
-    return (ret);
+
+    return (ret); // 返回操作结果。如果中途出错，返回错误码。
 }
 
 /*

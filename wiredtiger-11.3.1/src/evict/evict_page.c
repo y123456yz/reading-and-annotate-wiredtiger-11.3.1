@@ -158,7 +158,8 @@ __wt_evict(WT_SESSION_IMPL *session, WT_REF *ref, WT_REF_STATE previous_state, u
     clean_page = ebusy_only = false;
 
     __wt_verbose_debug3(
-      session, WT_VERB_EVICTION, "page %p (%s)", (void *)page, __wt_page_type_string(page->type));
+      session, WT_VERB_EVICTION, "wt evict page %p (%s), page size:%d", (void *)page, 
+        __wt_page_type_string(page->type), (int)page->memory_footprint);
 
     tree_dead = F_ISSET(session->dhandle, WT_DHANDLE_DEAD);
     if (tree_dead)
@@ -222,6 +223,7 @@ __wt_evict(WT_SESSION_IMPL *session, WT_REF *ref, WT_REF_STATE previous_state, u
      */
     WT_ERR(__evict_review(session, ref, flags, &inmem_split));
 
+    //printf("yang test xxxxxxxx __wt_page:%p, inmem_split:%d, %d \r\n", page, inmem_split, F_ISSET_ATOMIC_16(page, WT_PAGE_SPLIT_INSERT));
     /*
      * If we decide to do an in-memory split. Do it now. If an in-memory split completes, the page
      * stays in memory and the tree is left in the desired state: avoid the usual cleanup.
@@ -759,6 +761,7 @@ __evict_review_obsolete_time_window(WT_SESSION_IMPL *session, WT_REF *ref)
 /*
  * __evict_review --
  *     Review the page and its subtree for conditions that would block its eviction.
+ *     检查页面及其子树是否存在阻止逐出操作的条件。
  */
 static int
 __evict_review(WT_SESSION_IMPL *session, WT_REF *ref, uint32_t evict_flags, bool *inmem_splitp)
@@ -769,30 +772,34 @@ __evict_review(WT_SESSION_IMPL *session, WT_REF *ref, uint32_t evict_flags, bool
     WT_PAGE *page;
     bool closing, modified;
 
-    *inmem_splitp = false;
+    *inmem_splitp = false; // 初始化标志，表示是否需要内存中的页面拆分
 
-    btree = S2BT(session);
-    conn = S2C(session);
-    page = ref->page;
-    closing = FLD_ISSET(evict_flags, WT_EVICT_CALL_CLOSING);
+    btree = S2BT(session); // 获取当前会话关联的B树
+    conn = S2C(session);   // 获取当前会话关联的连接
+    page = ref->page;      // 获取当前页面
+    closing = FLD_ISSET(evict_flags, WT_EVICT_CALL_CLOSING); // 检查是否是关闭操作触发的逐出
 
     /*
      * Fail if an internal has active children, the children must be evicted first. The test is
      * necessary but shouldn't fire much: the eviction code is biased for leaf pages, an internal
      * page shouldn't be selected for eviction until all children have been evicted.
+     * 如果是内部页面且有活跃的子页面，则逐出失败，必须先逐出子页面。
+     * 这种情况不应该经常发生，因为逐出代码优先选择叶子页面，内部页面通常在所有子页面被逐出后才会被选择。
      */
     if (F_ISSET(ref, WT_REF_FLAG_INTERNAL)) {
-        WT_WITH_PAGE_INDEX(session, ret = __evict_child_check(session, ref));
+        WT_WITH_PAGE_INDEX(session, ret = __evict_child_check(session, ref)); // 检查子页面状态
         if (ret != 0)
-            WT_STAT_CONN_INCR(session, eviction_fail_active_children_on_an_internal_page);
-        WT_RET(ret);
+            WT_STAT_CONN_INCR(session, eviction_fail_active_children_on_an_internal_page); // 统计失败次数
+        WT_RET(ret); // 如果有活跃子页面，返回错误
     }
 
     /* It is always OK to evict pages from dead trees if they don't have children. */
+    // 如果数据句柄标记为“死树”，且页面没有子页面，则可以直接逐出
     if (F_ISSET(session->dhandle, WT_DHANDLE_DEAD))
         return (0);
 
     /* Review the obsolete time window information before eviction. */
+    // 检查页面的过时时间窗口信息
     WT_RET(__evict_review_obsolete_time_window(session, ref));
 
     /*
@@ -800,33 +807,40 @@ __evict_review(WT_SESSION_IMPL *session, WT_REF *ref, uint32_t evict_flags, bool
      * internal pages otherwise there is a race where a page could be marked modified due to a child
      * being transitioned to WT_REF_DISK after the modified check and before we visited the ref
      * while walking the parent index.
+     * 获取页面的修改状态。这必须在检查可逐出的内部页面之后进行，
+     * 否则可能会出现竞争条件：页面可能在修改检查后被标记为已修改。
      */
     modified = __wt_page_is_modified(page);
 
     /*
      * Clean pages can't be evicted when running in memory only. This should be uncommon - we don't
      * add clean pages to the queue.
+     * 在仅内存模式下，干净页面不能被逐出。这种情况应该很少见，因为我们不会将干净页面添加到队列中。
      */
     if (F_ISSET(conn, WT_CONN_IN_MEMORY) && !modified && !closing)
-        return (__wt_set_return(session, EBUSY));
+        return (__wt_set_return(session, EBUSY)); // 返回忙状态，表示页面不能逐出
 
     /* Check if the page can be evicted. */
+    // 检查页面是否可以逐出
     if (!closing) {
         /*
          * Update the oldest ID to avoid wasted effort should it have fallen behind current.
+         * 更新最旧的事务ID，以避免浪费努力（如果它落后于当前事务）。
          */
         if (modified)
-            WT_RET(__wt_txn_update_oldest(session, WT_TXN_OLDEST_STRICT));
+            WT_RET(__wt_txn_update_oldest(session, WT_TXN_OLDEST_STRICT)); // 更新最旧事务ID
 
         if (!__wt_page_can_evict(session, ref, inmem_splitp))
-            return (__wt_set_return(session, EBUSY));
+            return (__wt_set_return(session, EBUSY)); // 如果页面不能逐出，返回忙状态
 
         /* Check for an append-only workload needing an in-memory split. */
+        // 检查是否是追加写入工作负载，需要内存中的页面拆分
         if (*inmem_splitp)
-            return (0);
+            return (0); // 如果需要内存拆分，返回成功，交由调用者处理
     }
 
     /* If the page is clean, we're done and we can evict. */
+    // 如果页面是干净的，可以直接逐出
     if (!modified)
         return (0);
 
@@ -838,20 +852,27 @@ __evict_review(WT_SESSION_IMPL *session, WT_REF *ref, uint32_t evict_flags, bool
      * Evicting an non-HS dirty page can generate even more HS content. As we cannot evict HS pages
      * while checkpoint is operating on the HS file, we can end up in a situation where we exceed
      * the cache size limit.
+     * 如果尝试逐出一个脏页面，该页面不属于历史存储（HS），且检查点正在处理HS文件，
+     * 如果缓存中已经充满了脏的HS内容，则暂时避免逐出该脏页面。
+     *
+     * 逐出非HS脏页面可能会生成更多的HS内容，而在检查点操作HS文件时无法逐出HS页面，
+     * 这可能导致缓存大小超出限制。
      */
     if (conn->txn_global.checkpoint_running_hs && !WT_IS_HS(btree->dhandle) &&
       __wti_evict_hs_dirty(session) && __wt_cache_full(session)) {
-        WT_STAT_CONN_INCR(session, cache_eviction_blocked_checkpoint_hs);
-        return (__wt_set_return(session, EBUSY));
+        WT_STAT_CONN_INCR(session, cache_eviction_blocked_checkpoint_hs); // 统计阻止逐出的次数
+        return (__wt_set_return(session, EBUSY)); // 返回忙状态，表示页面不能逐出
     }
+
     /*
      * If reconciliation is disabled for this thread (e.g., during an eviction that writes to the
      * history store or reading a checkpoint), give up.
+     * 如果当前线程禁用了对页面的对账（例如在写入历史存储或读取检查点时），放弃逐出。
      */
     if (F_ISSET(session, WT_SESSION_NO_RECONCILE))
-        return (__wt_set_return(session, EBUSY));
+        return (__wt_set_return(session, EBUSY)); // 返回忙状态，表示页面不能逐出
 
-    return (0);
+    return (0); // 页面可以逐出
 }
 
 /*

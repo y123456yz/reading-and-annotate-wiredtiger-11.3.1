@@ -2418,6 +2418,11 @@ __session_get_rollback_reason(WT_SESSION *wt_session)
 /*
  * __session_checkpoint --
  *     WT_SESSION->checkpoint method.
+ * 
+检查点需要捕获一个事务一致的快照，确保写入磁盘的数据是事务一致的。
+ 事务一致性意味着：
+    所有已提交的事务的修改都会包含在检查点中。
+    未提交的事务的修改不会包含在检查点中。
  */
 static int
 __session_checkpoint(WT_SESSION *wt_session, const char *config)
@@ -2442,6 +2447,7 @@ __session_checkpoint(WT_SESSION *wt_session, const char *config)
      * during the checkpoint. Eviction is prevented from evicting anything newer than this because
      * we track the oldest transaction ID in the system that is not visible to all readers.
      */
+    //通过 __wt_txn_context_check(session, false) 确保当前会话没有运行事务。
     WT_ERR(__wt_txn_context_check(session, false));
 
     ret = __wt_txn_checkpoint(session, cfg, true);

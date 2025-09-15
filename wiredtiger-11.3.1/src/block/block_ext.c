@@ -164,6 +164,29 @@ __block_size_srch(WT_SIZE **head, wt_off_t size, WT_SIZE ***stack)
  *
  * 在按偏移量排序的跳表中查找指定偏移量的前后元素。
  * 用于合并和重叠检测，找到可能需要合并的相邻块。
+ * 举例:
+Level 3: NULL -> [10] -> [50] -> NULL
+Level 2: NULL -> [10] -> [30] -> [50] -> NULL
+Level 1: NULL -> [10] -> [20] -> [30] -> [50] -> NULL
+Level 0: NULL -> [10] -> [15] -> [20] -> [25] -> [30] -> [50] -> NULL
+
+目标偏移量：off = 22
+查找过程：
+    1.  从最高层（Level 3）开始：
+      当前元素 [10]，继续向右。
+      遇到 [50]，停止，下降到 Level 2。
+    2.  在 Level 2：
+      当前元素 [10]，继续向右。
+      遇到 [30]，停止，下降到 Level 1。
+    3.  在 Level 1：
+      当前元素 [20]，继续向右。
+      遇到 [30]，停止，下降到 Level 0。
+    4.  在 Level 0：
+      当前元素 [20]，继续向右。
+      遇到 [25]，停止。
+结果：
+beforep 指向 [20]。
+afterp 指向 [25]。
  */
 static WT_INLINE void
 __block_off_srch_pair(WT_EXTLIST *el, wt_off_t off, WT_EXT **beforep, WT_EXT **afterp)

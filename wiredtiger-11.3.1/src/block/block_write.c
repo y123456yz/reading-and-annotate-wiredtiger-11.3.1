@@ -46,7 +46,8 @@ __wti_block_truncate(WT_SESSION_IMPL *session, WT_BLOCK *block, wt_off_t len)
     // 备份期间禁止截断文件，防止影响备份一致性
     if (__wt_atomic_load64(&conn->hot_backup_start) == 0)
         WT_WITH_HOTBACKUP_READ_LOCK(session, ret = __wt_ftruncate(session, block->fh, len), NULL);
-
+        __wt_verbose(
+      session, WT_VERB_BLOCK, "yang test end: truncate file %s to %" PRIuMAX, block->name, (uintmax_t)len);
     /*
      * The truncate may fail temporarily or permanently (for example, there may be a file mapping if
      * there's an open checkpoint on the file on a POSIX system, in which case the underlying

@@ -25,6 +25,7 @@ __wt_txn_context_prepare_check(WT_SESSION_IMPL *session)
 /*
  * __wt_txn_context_check --
  *     Complain if a transaction is/isn't running.
+ * 通过 __wt_txn_context_check(session, false) 确保当前会话没有运行事务。
  */
 static WT_INLINE int
 __wt_txn_context_check(WT_SESSION_IMPL *session, bool requires_txn)

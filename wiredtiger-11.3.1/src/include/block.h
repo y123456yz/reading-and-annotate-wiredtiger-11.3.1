@@ -190,6 +190,56 @@ typedef struct {
 /*
  * __wt_block_ckpt --
  * 检查点结构，记录空间分配、释放、可用等信息。
+ * 
+三个变量的关系
+  1. 分配空间：
+  2. 从 avail 列表中查找合适的块，分配后将其从 avail 移动到 alloc。
+释放空间：
+    将释放的块从 alloc 移动到 discard。
+回收空间：
+    在某些情况下（如检查点完成后），将 discard 列表中的块合并到 avail 列表中。
+
+举例说明
+场景 1：分配空间
+1.  初始状态：
+    avail 列表：[10, 20), [30, 40), [50, 60)
+    alloc 列表：空
+    discard 列表：空
+2.  操作：
+    分配一个大小为 10 的空间块。
+3.  结果：
+    从 avail 中移除 [10, 20)，并将其加入 alloc。
+    avail 列表：[30, 40), [50, 60)
+    alloc 列表：[10, 20)
+    discard 列表：空
+
+
+场景 2：释放空间
+1.  初始状态：
+    avail 列表：[30, 40), [50, 60)
+    alloc 列表：[10, 20)
+    discard 列表：空
+2.  操作：
+    释放 [10, 20)。
+3.  结果：
+    从 alloc 中移除 [10, 20)，并将其加入 discard。
+    avail 列表：[30, 40), [50, 60)
+    alloc 列表：空
+    discard 列表：[10, 20)
+
+
+场景 3：回收空间
+1.  初始状态：
+    avail 列表：[30, 40), [50, 60)
+    alloc 列表：空
+    discard 列表：[10, 20)
+2.  操作：
+    将 discard 列表中的块合并到 avail。
+3.  结果：
+    从 discard 中移除 [10, 20)，并将其加入 avail。
+    avail 列表：[10, 20), [30, 40), [50, 60)
+    alloc 列表：空
+    discard 列表：空
  */
 struct __wt_block_ckpt {
     uint8_t version; /* Version 版本号 */
@@ -202,11 +252,12 @@ struct __wt_block_ckpt {
     WT_EXTLIST avail;   /* Extents available 当前可分配空间块 */
     WT_EXTLIST discard; /* Extents discarded 本次释放的空间块 */
 
+    //赋值参考__ckpt_update， 也就是block->size，也就是做checkpoint时候的文件大小
     wt_off_t file_size; /* Checkpoint file size 检查点时文件大小 */
-    uint64_t ckpt_size; /* Checkpoint byte count 检查点字节数 */
+    //ckpt_size实际上就是真实ext数据空间=file_size - avail空间(也就是磁盘碎片)
+    uint64_t ckpt_size; /* Checkpoint byte count 检查点字节数，反映检查点的存储占用 */
 
     WT_EXTLIST ckpt_avail; /* Checkpoint free'd extents 检查点期间释放的空间块 */
-
     /*
      * Checkpoint archive: the block manager may potentially free a lot of memory from the
      * allocation and discard extent lists when checkpoint completes. Put it off until the

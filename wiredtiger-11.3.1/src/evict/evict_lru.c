@@ -1288,12 +1288,13 @@ __evict_lru_pages(WT_SESSION_IMPL *session, bool is_server)
 
     WT_TRACK_OP_INIT(session);
     conn = S2C(session);
-
+    
     /*
      * Reconcile and discard some pages: EBUSY is returned if a page fails eviction because it's
      * unavailable, continue in that case.
      */
-    while (F_ISSET(conn, WT_CONN_EVICTION_RUN) && ret == 0)
+    //printf("yang test .......__evict_lru_pages..\r\n");
+    while (F_ISSET(conn, WT_CONN_EVICTION_RUN) && ret == 0) 
         if ((ret = __evict_page(session, is_server)) == EBUSY)
             ret = 0;
 
@@ -2723,7 +2724,8 @@ __evict_page(WT_SESSION_IMPL *session, bool is_server)
      * by the time we look at it.
      */
     __wti_evict_read_gen_bump(session, ref->page);
-
+    
+    //printf("yang test .......__evict_page..... page:%p\r\n", ref->page);
     WT_WITH_BTREE(session, btree, ret = __wt_evict(session, ref, previous_state, flags));
 
     (void)__wt_atomic_subv32(&btree->evict_busy, 1);
@@ -2865,6 +2867,7 @@ __wti_evict_app_assist_worker(WT_SESSION_IMPL *session, bool busy, bool readonly
             break;
 
         /* Evict a page. */
+        //printf("yang test .......__wti_evict_app_assist_worker..\r\n");
         switch (ret = __evict_page(session, false)) {
         case 0:
             if (busy)

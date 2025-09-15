@@ -1674,7 +1674,8 @@ __wt_leaf_page_can_split(WT_SESSION_IMPL *session, WT_PAGE *page)
     int count;
 
     btree = S2BT(session);
-
+    //printf("yang test ....xxxxxdxxxx...__wt_leaf_page_can_split....page:%p.....,page size:%d\r\n", 
+    //    page, (int)page->memory_footprint);
     /*
      * Checkpoints can't do in-memory splits in the tree they are walking: that can lead to
      * corruption when the parent internal page is updated.
@@ -1686,9 +1687,10 @@ __wt_leaf_page_can_split(WT_SESSION_IMPL *session, WT_PAGE *page)
      * Only split a page once, otherwise workloads that update in the middle of the page could
      * continually split without benefit.
      */
-    if (F_ISSET_ATOMIC_16(page, WT_PAGE_SPLIT_INSERT))
+    if (F_ISSET_ATOMIC_16(page, WT_PAGE_SPLIT_INSERT)) {
+        //printf("yang test .......__wt_leaf_page_can_split....page:%p.....\r\n", page);
         return (false);
-
+    }
     /*
      * Check for pages with append-only workloads. A common application pattern is to have multiple
      * threads frantically appending to the tree. We want to reconcile and evict this page, but we'd
@@ -1812,6 +1814,7 @@ __wt_page_evict_retry(WT_SESSION_IMPL *session, WT_PAGE *page)
 /*
  * __wt_page_can_evict --
  *     Check whether a page can be evicted.
+ *     检查页面是否可以逐出。
  */
 static WT_INLINE bool
 __wt_page_can_evict(WT_SESSION_IMPL *session, WT_REF *ref, bool *inmem_splitp)
@@ -1821,19 +1824,22 @@ __wt_page_can_evict(WT_SESSION_IMPL *session, WT_REF *ref, bool *inmem_splitp)
     bool modified;
 
     if (inmem_splitp != NULL)
-        *inmem_splitp = false;
+        *inmem_splitp = false; // 初始化内存拆分标志为false
 
-    page = ref->page;
-    mod = page->modify;
+    page = ref->page; // 获取页面指针
+    mod = page->modify; // 获取页面的修改信息
 
     /*
      * We cannot evict the page in the prefetch queue. Eviction may split the page and free the ref.
      * The prefetch thread would crash if it sees a freed ref.
+     * 如果页面在预取队列中，则不能逐出。逐出可能会拆分页面并释放ref，
+     * 如果预取线程访问已释放的ref，会导致崩溃。
      */
     if (F_ISSET_ATOMIC_8(ref, WT_REF_FLAG_PREFETCH))
         return (false);
 
     /* Pages without modify structures can always be evicted, it's just discarding a disk image. */
+    // 如果页面没有修改结构，可以直接逐出，因为只需丢弃磁盘映像。
     if (mod == NULL)
         return (true);
 
@@ -1851,6 +1857,7 @@ __wt_page_can_evict(WT_SESSION_IMPL *session, WT_REF *ref, bool *inmem_splitp)
      * remains until the next reconciliation, and nothing prevents that from occurring before the
      * transaction commits.
      */
+    // 检查快速截断信息。如果页面有未提交的截断操作，则不能逐出。
     if (mod->inst_updates != NULL) {
         WT_STAT_CONN_DSRC_INCR(session, cache_eviction_blocked_uncommitted_truncate);
         return (false);
@@ -1863,6 +1870,8 @@ __wt_page_can_evict(WT_SESSION_IMPL *session, WT_REF *ref, bool *inmem_splitp)
      * historical tables, reconciliation no longer writes overflow cookies on internal pages, no
      * matter the size of the key.)
      */
+    // 如果父页面的键是溢出项，则不能拆分或逐出多块行存储页面。
+    // 这是为了避免破坏检查点的块管理。
     if (__wt_btree_syncing_by_other_session(session) &&
       F_ISSET_ATOMIC_16(ref->home, WT_PAGE_INTL_OVERFLOW_KEYS)) {
         WT_STAT_CONN_DSRC_INCR(session, cache_eviction_blocked_overflow_keys);
@@ -1874,19 +1883,23 @@ __wt_page_can_evict(WT_SESSION_IMPL *session, WT_REF *ref, bool *inmem_splitp)
      * return success immediately and skip more detailed eviction tests. We don't need further tests
      * since the page won't be written or discarded from the cache.
      */
+    // 在其他逐出测试之前，检查是否需要内存拆分。
+    // 如果页面需要内存拆分，直接返回true，跳过更详细的逐出测试。
     if (__wt_leaf_page_can_split(session, page)) {
         if (inmem_splitp != NULL)
-            *inmem_splitp = true;
+            *inmem_splitp = true; // 标记需要内存拆分
         return (true);
     }
 
-    modified = __wt_page_is_modified(page);
+    modified = __wt_page_is_modified(page); // 检查页面是否已修改
 
     /*
      * If the file is being checkpointed, other threads can't evict dirty pages: if a page is
      * written and the previous version freed, that previous version might be referenced by an
      * internal page already written in the checkpoint, leaving the checkpoint inconsistent.
      */
+    // 如果文件正在被检查点操作，其他线程不能逐出脏页面。
+    // 因为逐出可能导致检查点中的内部页面引用不一致。
     if (modified && __wt_btree_syncing_by_other_session(session)) {
         WT_STAT_CONN_DSRC_INCR(session, cache_eviction_blocked_checkpoint);
         return (false);
@@ -1903,6 +1916,8 @@ __wt_page_can_evict(WT_SESSION_IMPL *session, WT_REF *ref, bool *inmem_splitp)
      * One special case where we know this is safe is if the handle is dead or locked exclusively,
      * that is, no readers can be looking at an old index.
      */
+    // 检查是否正在逐出一个可访问的内部页面，并且该页面有活动的拆分代。
+    // 如果拆分创建了新的内部页面，这些页面不能被逐出，直到所有线程退出原始父页面的索引。
     if (F_ISSET(ref, WT_REF_FLAG_INTERNAL) &&
       !F_ISSET(session->dhandle, WT_DHANDLE_DEAD | WT_DHANDLE_EXCLUSIVE) &&
       __wt_gen_active(session, WT_GEN_SPLIT, page->pg_intl_split_gen)) {
@@ -1911,13 +1926,14 @@ __wt_page_can_evict(WT_SESSION_IMPL *session, WT_REF *ref, bool *inmem_splitp)
     }
 
     /* If the metadata page is clean but has modifications that appear too new to evict, skip it. */
+    // 如果元数据页面是干净的，但有太新的修改，不能逐出。
     if (WT_IS_METADATA(S2BT(session)->dhandle) && !modified &&
       !__wt_txn_visible_all(session, mod->rec_max_txn, mod->rec_max_timestamp)) {
         WT_STAT_CONN_DSRC_INCR(session, cache_eviction_blocked_recently_modified);
         return (false);
     }
 
-    return (true);
+    return (true); // 页面可以逐出
 }
 
 /*
@@ -1931,18 +1947,21 @@ __wt_page_release(WT_SESSION_IMPL *session, WT_REF *ref, uint32_t flags)
     WT_DECL_RET;
     bool inmem_split;
 
+    /* 获取当前会话对应的 btree 结构指针，用于后续判断文件级别属性（如是否为纯内存句柄）。 */
     btree = S2BT(session);
 
     /*
      * Discard our hazard pointer. Ignore pages we don't have and the root page, which sticks in
      * memory, regardless.
      */
+    /* 说明：如果没有 ref、ref 没有 page，或 ref 是根页面，则无需处理 hazard 指针或逐出，直接返回。 */
     if (ref == NULL || ref->page == NULL || __wt_ref_is_root(ref))
         return (0);
 
     /*
      * If hazard pointers aren't necessary for this file, we can't be evicting, we're done.
      */
+    /* 说明：对于 WT_BTREE_IN_MEMORY 的句柄（纯内存表），不使用 hazard 指针且不做逐出，直接返回。 */
     if (F_ISSET(btree, WT_BTREE_IN_MEMORY))
         return (0);
 
@@ -1950,16 +1969,33 @@ __wt_page_release(WT_SESSION_IMPL *session, WT_REF *ref, uint32_t flags)
      * If the session is configured with the release_evict_pages debug option, we will attempt to
      * evict the pages when they are no longer needed.
      */
+    /* 说明：调试路径：如果会话开启 release_evict_pages，尝试立即释放并驱动逐出（非致命 EBUSY 被吞掉）。 */
     if (F_ISSET(session, WT_SESSION_DEBUG_RELEASE_EVICT)) {
         WT_TRET_BUSY_OK(__wt_page_release_evict(session, ref, flags));
         return (0);
     }
 
+    /* 
+     * 检查该页面是否应尽快被逐出（例如为脏页且满足逐出策略、或长期不活跃等）。
+     * __wt_evict_page_soon_check 会根据页面状态返回 true/false，且通过 inmem_split 输出
+     * 是否应该先执行内存拆分（将插入链表分离到新页）以便后续逐出/写回。
+     */
     if (__wt_evict_page_soon_check(session, ref, &inmem_split)) {
         /*
          * If the operation has disabled eviction or splitting, or the session is preventing from
          * reconciling, then just queue the page for urgent eviction. Otherwise, attempt to release
          * and evict it.
+         */
+        /* 说明：
+         * - LF_ISSET(WT_READ_NO_EVICT)：调用方禁止在本次读写操作期间逐出页面。
+         * - LF_ISSET(WT_READ_NO_SPLIT)：调用方禁止拆分；当 inmem_split 为 true 且调用方禁止拆分时，
+         *   不做内存拆分而走紧急队列路径。
+         * - WT_SESSION_NO_RECONCILE：会话禁止 reconcile（对账/写盘），此时无法同步逐出页面。
+         *
+         * 行为：
+         * - 如果调用方/会话禁止立即逐出或禁止拆分，则将页面放入紧急逐出队列，由后台线程处理。
+         * - 否则尝试立即释放并驱动逐出（__wt_page_release_evict），该函数会在释放 hazard 后尝试对页面进行对账/写盘。
+         * - WT_IGNORE_RET/WT_RET_BUSY_OK 宏用于将 EBUSY 视为非致命或记录后继续（不将其当作致命错误返回）。
          */
         if (LF_ISSET(WT_READ_NO_EVICT) ||
           (inmem_split ? LF_ISSET(WT_READ_NO_SPLIT) : F_ISSET(session, WT_SESSION_NO_RECONCILE)))
@@ -1970,6 +2006,10 @@ __wt_page_release(WT_SESSION_IMPL *session, WT_REF *ref, uint32_t flags)
         }
     }
 
+    /* 
+     * 最后路径：既没有触发立即逐出/入队，也没有调试选项强制逐出，则仅清除当前会话对该 ref 的 hazard 指针。
+     * 清除 hazard 后，其他线程可以安全地对该页面执行逐出。
+     */
     return (__wt_hazard_clear(session, ref));
 }
 

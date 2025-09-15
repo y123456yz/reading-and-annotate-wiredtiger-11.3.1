@@ -145,7 +145,7 @@ access_example(int argc, char *argv[])
 
         /* Open a connection to the database, creating it if necessary. */
         //error_check(wiredtiger_open(home, NULL, "create,statistics=(all),verbose=[block:1, metadata:0, api:0]", &conn));
-        error_check(wiredtiger_open(home, NULL, "checkpoint=[wait=60],eviction=(threads_min=1, threads_max=1),create, cache_size=10G, verbose=[split:2, block:2,reconcile:2,compact=0, api:0, metadata:0, api:0]", &conn));
+        error_check(wiredtiger_open(home, NULL, "checkpoint=[wait=21110],eviction=(threads_min=1, threads_max=1),create, cache_size=5G, verbose=[all:0, eviction:5, split:5, block:5,reconcile:5,compact=0, api:0, metadata:0]", &conn));
         //
        // error_check(wiredtiger_open(home, NULL, "create,statistics=(fast),statistics_log=(json,wait=1),in_memory=true", &conn));
                 
@@ -156,7 +156,7 @@ access_example(int argc, char *argv[])
 
         /*! [access example table create] */
         //Õë¶Ôserver²ãµÄÃüÁîÎª: db.createCollection("sbtest4",{storageEngine: { wiredTiger: {configString: "leaf_page_max:4KB, leaf_key_max=4K"}}})
-        error_check(session->create(session, "table:access", "memory_page_max=32K,key_format=q,value_format=S"));
+        error_check(session->create(session, "table:access", "key_format=q,value_format=S"));
         /*! [access example table create] */
 
         /*! [access example cursor open] */
@@ -165,7 +165,7 @@ access_example(int argc, char *argv[])
         
         printf("yang test ............. insert xxxxxx\r\n");
 
-        #define MAX_TEST_KV_NUM 1000//1000000
+        #define MAX_TEST_KV_NUM 1000 //1000000
          //insert
         for (i = 0; i < MAX_TEST_KV_NUM; i++) {
             snprintf(buf, sizeof(buf), "key%d", i);
@@ -183,10 +183,10 @@ access_example(int argc, char *argv[])
               //  printf("yang test xxxx.........................11111.........................\r\n");
             }
         }
-        printf("yang test checkpoint.........................11111.........................\r\n");
+        printf("yang test checkpoint........insert end.................11111.........................\r\n\r\n\r\n\r\n\r\n");
         testutil_check(session->checkpoint(session, NULL));
-        testutil_check(conn->reconfigure(conn, "checkpoint=[wait=11160]"));
-        for (i = 0; i < MAX_TEST_KV_NUM - 1; i++) {
+        //testutil_check(conn->reconfigure(conn, "checkpoint=[wait=11160]"));
+        for (i = 0; i < MAX_TEST_KV_NUM; i++) {
            // continue;
             snprintf(buf, sizeof(buf), "key%d", i);
             cursor->set_key(cursor, i);
@@ -197,14 +197,19 @@ access_example(int argc, char *argv[])
             error_check(cursor->remove(cursor));
            // break;
         }
-        
+        printf("yang test checkpoint........remove end.................11111.........................\r\n\r\n\r\n\r\n\r\n");
         testutil_check(session->checkpoint(session, NULL));
-        printf("yang test checkpoint.........................222222.........................\r\n");
+         printf("yang test checkpoint1.....................remove end..............\r\n\r\n\r\n\r\n");
+        testutil_check(session->checkpoint(session, NULL));
+        printf("yang test checkpoint2.....................remove end..............\r\n\r\n\r\n\r\n");
+        testutil_check(session->checkpoint(session, NULL));
+        printf("yang test checkpoint3.....................remove end..............\r\n\r\n\r\n\r\n");
+        printf("yang test checkpoint.........................222222...........remove end..............\r\n\r\n\r\n\r\n");
         while ((ret = cursor->next(cursor)) == 0) {
-            error_check(cursor->get_key(cursor, &key));
+            error_check(cursor->get_key(cursor, &i));
             error_check(cursor->get_value(cursor, &value));
 
-            printf("Got record: %s : %s\n", key, value);
+            printf("Got record: %d : %s\n", i, value);
         }
 
        // testutil_check(session->checkpoint(session, NULL));
